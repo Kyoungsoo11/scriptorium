@@ -94,6 +94,7 @@ for (const f of Object.values(MODEL_FILES)) copy(need(path.join(ROOT, 'models', 
 // entry point and docs
 fs.writeFileSync(path.join(OUT, 'scriptorium.cmd'), '@echo off\r\n"%~dp0runtime\\node.exe" "%~dp0app\\bin\\scriptorium.js" %*\r\n');
 copy(path.join(ROOT, 'README.md'), path.join(OUT, 'README.md'));
+copy(path.join(ROOT, 'LICENSE'), path.join(OUT, 'LICENSE'));
 
 // licenses
 const L = path.join(OUT, 'LICENSES');

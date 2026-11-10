@@ -501,7 +501,9 @@ GPU(Vulkan) 빌드는 [Vulkan SDK](https://vulkan.lunarg.com/)를 설치한 뒤 
 
 ## 라이선스
 
-배포판에 들어 있는 부품과 라이선스는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 있다 (whisper.cpp·ggml MIT, Whisper 모델 MIT, sherpa-onnx Apache-2.0, ONNX Runtime MIT, Silero VAD MIT, pyannote segmentation MIT, 3D-Speaker Apache-2.0, Node.js MIT, Visual C++ 런타임). 배포 zip의 `LICENSES\` 폴더에 원문이 있다.
+Scriptorium 자체 코드는 [MIT 라이선스](LICENSE)다.
+
+배포판에 들어 있는 다른 부품과 라이선스는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 있다 (whisper.cpp·ggml MIT, Whisper 모델 MIT, sherpa-onnx Apache-2.0, ONNX Runtime MIT, Silero VAD MIT, pyannote segmentation MIT, 3D-Speaker Apache-2.0, Node.js MIT, Visual C++ 런타임). 배포 zip의 `LICENSES\` 폴더에 원문이 있다.
 
 ---
 

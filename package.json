@@ -2,7 +2,7 @@
   "name": "scriptorium",
   "version": "0.2.0",
   "description": "Offline, server-free lecture/meeting transcription CLI (file and live recording) modelled on Alt, built on whisper.cpp and sherpa-onnx. Needs no Alt install.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "type": "commonjs",
   "bin": {
