@@ -1,6 +1,6 @@
 # Scriptorium
 
-**인터넷 없이 내 PC에서만 돌아가는 강의·회의 전사 도구 (Windows, 명령줄).**
+**인터넷 없이 내 PC에서만 돌아가는 강의·회의 전사 도구 (Windows, CLI).**
 Offline lecture/meeting transcription for Windows — a non-interactive CLI, no server, no account.
 
 - 오디오·비디오 파일 전사, 마이크 + 컴퓨터 소리(시스템 오디오) 실시간 녹음 전사
