@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+vendor/
+models/
+
+# test/ holds only unit tests in the repo; recordings and transcripts used for local
+# evaluation stay out of version control.
+test/*
+!test/*.test.js

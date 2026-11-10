@@ -1,0 +1,23 @@
+{
+  "name": "scriptorium",
+  "version": "0.2.0",
+  "description": "Offline, server-free lecture/meeting transcription CLI (file and live recording) modelled on Alt, built on whisper.cpp and sherpa-onnx. Needs no Alt install.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "scriptorium": "bin/scriptorium.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build:whisper": "scripts\\build-whisper.cmd cpu",
+    "build:core": "scripts\\build-core.cmd cpu",
+    "package": "node scripts/package.js"
+  },
+  "dependencies": {
+    "sherpa-onnx-node": "2.0.1"
+  }
+}
