@@ -102,6 +102,37 @@ copy(need(path.join(ROOT, 'vendor', 'whisper.cpp', 'LICENSE')), path.join(L, 'wh
 copyDir(path.join(ROOT, 'licenses'), L);
 copy(path.join(ROOT, 'THIRD_PARTY_NOTICES.md'), path.join(L, 'THIRD_PARTY_NOTICES.md'));
 
+// Claude Desktop Extension manifest (MCPB 0.3). The server runs on the bundled Node rather than
+// the one Claude ships, since Scriptorium needs Node 22.13+ (node:sqlite). Data goes to the
+// default %USERPROFILE%\.scriptorium, which Store-installed Claude does not redirect.
+const { TOOLS } = require(path.join(ROOT, 'src', 'mcp.js'));
+const manifest = {
+  manifest_version: '0.3',
+  name: 'scriptorium',
+  display_name: 'Scriptorium',
+  version: pkg.version,
+  description: 'Offline lecture and meeting transcription: audio/video files and live recording, with speaker separation.',
+  long_description:
+    'Transcribes audio and video files and live recordings (microphone plus computer audio) on this PC with whisper.cpp, separates speakers, and keeps notes you can search and export as subtitles, text or Markdown. Nothing is sent over the network.',
+  author: { name: 'Kim Kyoungsoo', url: 'https://github.com/Kyoungsoo11' },
+  repository: { type: 'git', url: 'https://github.com/Kyoungsoo11/scriptorium' },
+  homepage: 'https://github.com/Kyoungsoo11/scriptorium',
+  documentation: 'https://github.com/Kyoungsoo11/scriptorium#readme',
+  license: 'MIT',
+  keywords: ['transcription', 'speech-to-text', 'whisper', 'lecture', 'meeting', 'subtitles', 'offline'],
+  server: {
+    type: 'binary',
+    entry_point: 'runtime/node.exe',
+    mcp_config: {
+      command: '${__dirname}/runtime/node.exe',
+      args: ['${__dirname}/app/bin/scriptorium.js', 'mcp'],
+    },
+  },
+  tools: TOOLS.map(t => ({ name: t.name, description: t.description })),
+  compatibility: { platforms: ['win32'] },
+};
+fs.writeFileSync(path.join(OUT, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+
 const size = dir =>
   fs.readdirSync(dir, { withFileTypes: true }).reduce((s, e) => s + (e.isDirectory() ? size(path.join(dir, e.name)) : fs.statSync(path.join(dir, e.name)).size), 0);
 console.log(`folder: ${OUT} (${(size(OUT) / 1e6).toFixed(0)} MB)`);
@@ -115,4 +146,11 @@ if (zip) {
   const r = spawnSync(tar, ['-a', '-c', '-f', zipPath, '-C', path.dirname(OUT), name], { stdio: 'inherit' });
   if (r.status !== 0) process.exit(r.status ?? 1);
   console.log(`zip: ${zipPath} (${(fs.statSync(zipPath).size / 1e6).toFixed(0)} MB)`);
+
+  // .mcpb: the same files with manifest.json at the archive root (no top-level folder).
+  const mcpbPath = path.join(ROOT, 'dist', `scriptorium-${pkg.version}.mcpb`);
+  fs.rmSync(mcpbPath, { force: true });
+  const m = spawnSync(tar, ['--format', 'zip', '-c', '-f', mcpbPath, '-C', OUT, ...fs.readdirSync(OUT)], { stdio: 'inherit' });
+  if (m.status !== 0) process.exit(m.status ?? 1);
+  console.log(`mcpb: ${mcpbPath} (${(fs.statSync(mcpbPath).size / 1e6).toFixed(0)} MB)`);
 }

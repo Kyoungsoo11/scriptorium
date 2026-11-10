@@ -8,6 +8,7 @@ Offline lecture/meeting transcription for Windows — a non-interactive CLI, no 
 - 자막(SRT/VTT), 텍스트, Markdown, JSON 내보내기, 노트·폴더·검색
 - **모든 명령이 옵션만으로 끝까지 실행**된다. 묻는 화면이 없어서 스크립트·자동화·AI 에이전트가 호출하기 좋다
 - 결과는 stdout에 JSON, 진행 상황은 stderr. 종료 코드 0/1/2
+- **Claude Desktop 채팅에서 말로 시킬 수 있다** (MCP 서버 내장): "이 강의 파일 전사해 줘", "지금부터 회의 녹음해 줘"
 - 실행 중 네트워크 통신 없음. 녹음과 노트는 내 PC에만 저장
 
 > Scriptorium은 강의 노트 앱 [Alt](https://altalt.io)의 전사 기능이 어떻게 동작하는지 분석해, 공개된 오픈소스 부품으로 처음부터 다시 만든 도구입니다. Alt의 코드·바이너리·모델은 전혀 포함하지 않으며, Alt 개발사와 관계가 없습니다.
@@ -22,18 +23,21 @@ Offline lecture/meeting transcription for Windows — a non-interactive CLI, no 
 4. [옵션](#옵션)
 5. [출력](#출력)
 6. [실시간 녹음 다루기](#실시간-녹음-다루기)
-7. [다른 프로그램에서 호출하기](#다른-프로그램에서-호출하기)
-8. [데이터 위치와 설정](#데이터-위치와-설정)
-9. [성능과 품질](#성능과-품질)
-10. [문제 해결](#문제-해결)
-11. [동작 원리](#동작-원리)
-12. [소스에서 빌드](#소스에서-빌드)
-13. [라이선스](#라이선스)
-14. [알려진 한계](#알려진-한계)
+7. [Claude에서 쓰기 (MCP)](#claude에서-쓰기-mcp)
+8. [다른 프로그램에서 호출하기](#다른-프로그램에서-호출하기)
+9. [데이터 위치와 설정](#데이터-위치와-설정)
+10. [성능과 품질](#성능과-품질)
+11. [문제 해결](#문제-해결)
+12. [동작 원리](#동작-원리)
+13. [소스에서 빌드](#소스에서-빌드)
+14. [라이선스](#라이선스)
+15. [알려진 한계](#알려진-한계)
 
 ---
 
 ## 빠른 시작
+
+> Claude Desktop 채팅에서 쓰려면 `scriptorium-<버전>.mcpb`를 받아 더블클릭하면 된다 → [Claude에서 쓰기](#claude에서-쓰기-mcp)
 
 1. [Releases](../../releases)에서 `scriptorium-<버전>-win-x64.zip`(약 630 MB)을 받는다.
 2. 아무 폴더에 압축을 푼다. 예: `C:\Tools\scriptorium`
@@ -226,7 +230,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 
 | 옵션 | 설명 |
 |---|---|
-| `--data-dir <폴더>` | 노트 DB와 녹음 위치 (기본 `%APPDATA%\scriptorium`) |
+| `--data-dir <폴더>` | 노트 DB와 녹음 위치 (기본 `%USERPROFILE%\.scriptorium`) |
 | `--models-dir <폴더>` | 모델 폴더 (기본: 프로그램 폴더의 `models`) |
 | `--whisper-model <파일>` | 다른 ggml Whisper 모델 (예: 더 작고 빠른 모델) |
 | `--quiet` | stderr 진행 로그 끄기 |
@@ -318,6 +322,70 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 
 ---
 
+## Claude에서 쓰기 (MCP)
+
+Scriptorium에는 MCP 서버가 들어 있어서, Claude Desktop 채팅에서 말로 전사·녹음을 시킬 수 있다. 설치 방법은 둘 중 하나.
+
+### 방법 1: 확장 프로그램으로 설치
+
+1. [Releases](../../releases)에서 `scriptorium-<버전>.mcpb`(약 630 MB)를 받는다.
+2. 파일을 더블클릭하거나, Claude Desktop의 설정 → 확장 프로그램(Extensions) 화면에 끌어다 놓고 설치한다.
+3. 채팅 입력창의 도구 목록에 Scriptorium이 보이면 끝.
+
+### 방법 2: zip 설치본을 Claude에 연결
+
+zip을 풀어 둔 상태라면 명령 하나로 Claude Desktop 설정에 등록할 수 있다.
+
+```bash
+scriptorium setup-claude
+```
+
+- Claude Desktop 설정 파일(`claude_desktop_config.json`)을 찾아 `scriptorium` 서버를 추가한다. 일반 설치판과 Microsoft Store 설치판 위치를 모두 찾고, 다른 MCP 서버와 설정은 그대로 둔다.
+- 바꾸기 전 파일을 `claude_desktop_config.json.bak-<시각>`으로 백업한다.
+- **Claude Desktop을 완전히 종료했다가 다시 열어야** 적용된다 (작업 표시줄 트레이 아이콘에서 종료).
+- `--dry-run`: 무엇을 바꿀지만 보여 줌, `--remove`: 등록 해제, `--config <파일>`: 설정 파일 직접 지정
+
+직접 편집하려면 `mcpServers`에 이렇게 넣는다 (경로는 압축 푼 위치에 맞게):
+
+```json
+{
+  "mcpServers": {
+    "scriptorium": {
+      "command": "C:\\Tools\\scriptorium\\runtime\\node.exe",
+      "args": ["C:\\Tools\\scriptorium\\app\\bin\\scriptorium.js", "mcp"]
+    }
+  }
+}
+```
+
+### 이렇게 시키면 된다
+
+- "`D:\강의\3주차.m4a` 전사해 줘. 한국어고 화자는 교수님 한 명이야."
+- "아까 전사 끝났어? 끝났으면 핵심 내용 요약해 줘."
+- "온라인 강의 들을 거니까 컴퓨터 소리만 녹음해 줘." → 끝나면 "녹음 멈춰."
+- "노트 중에 '세마포어' 나온 거 찾아줘."
+- "SPEAKER_01은 '김민수'로 바꾸고, 자막 파일로 바탕화면에 저장해 줘."
+
+전사는 오래 걸리므로(녹음 길이의 약 0.4배) Claude는 작업을 시작해 두고 진행 상황을 확인한다. 대화를 닫아도 작업은 계속되고, 나중에 "전사 끝났어?"라고 물으면 결과를 확인한다.
+
+### 도구 목록
+
+| 도구 | 하는 일 |
+|---|---|
+| `scriptorium_transcribe_file` | 파일 전사를 백그라운드 작업으로 시작, jobId 반환 |
+| `scriptorium_get_job` | 작업 진행률·결과 (jobId 없이 부르면 최근 작업 목록) |
+| `scriptorium_start_recording` | 녹음 시작 (마이크/시스템 오디오/시간 제한 선택) |
+| `scriptorium_stop_recording` | 녹음 정지, 최대 50초 동안 마무리를 기다림 |
+| `scriptorium_list_recordings` | 실행 중인 녹음 |
+| `scriptorium_list_notes` | 노트 목록·검색 |
+| `scriptorium_get_transcript` | 전사 읽기 (긴 전사는 쪽 단위) |
+| `scriptorium_export_transcript` | 파일로 저장 (srt/vtt/txt/md/json) |
+| `scriptorium_rename_speaker` | 화자 이름 붙이기 |
+| `scriptorium_rename_note` | 노트 제목 바꾸기 |
+| `scriptorium_list_devices` | 오디오 장치 |
+
+명령줄과 Claude가 같은 데이터 폴더(`%USERPROFILE%\.scriptorium`)를 쓰므로, 어느 쪽에서 만든 노트든 서로 보인다. 다른 MCP 클라이언트(Claude Code 등)에서도 `scriptorium mcp`를 서버로 등록해 쓸 수 있다.
+
 ## 다른 프로그램에서 호출하기
 
 모든 명령이 대화 없이 끝나고, 결과를 stdout JSON 한 덩어리로 주므로 그대로 파싱하면 된다.
@@ -367,10 +435,12 @@ scriptorium notes export <noteId> --out 회의.md
 
 | 무엇 | 위치 |
 |---|---|
-| 노트 DB (SQLite) | `%APPDATA%\scriptorium\scriptorium.db` |
-| 녹음 WAV | `%APPDATA%\scriptorium\recordings\<noteId>.wav` |
-| 실행 중 녹음 상태·로그 | `%APPDATA%\scriptorium\run\` |
+| 노트 DB (SQLite) | `%USERPROFILE%\.scriptorium\scriptorium.db` |
+| 녹음 WAV | `%USERPROFILE%\.scriptorium\recordings\<noteId>.wav` |
+| 실행 중 녹음 상태·로그 | `%USERPROFILE%\.scriptorium\run\` |
 | 모델 | 프로그램 폴더 `models\` |
+
+0.2.0은 데이터를 `%APPDATA%\scriptorium`에 두었다. 0.3.0부터는 `%USERPROFILE%\.scriptorium`을 쓴다. Microsoft Store판 Claude Desktop이 실행한 프로그램은 AppData에 쓰는 내용이 Claude 전용 위치로 옮겨져서, 명령줄과 Claude의 노트가 갈라지기 때문이다. 0.2.0에서 만든 노트를 계속 쓰려면 폴더 내용을 옮기면 된다.
 
 환경 변수 (옵션과 같은 역할, 옵션이 우선):
 
@@ -418,6 +488,8 @@ scriptorium notes export <noteId> --out 회의.md
 | 시스템 오디오가 녹음 안 된다 | 소리가 기본 출력 장치(`devices`의 `"default":true` 스피커)로 나는지 확인. 블루투스 장치를 바꾸면 다시 시작 |
 | 마이크가 녹음 안 된다 | Windows 설정 → 개인 정보 → 마이크에서 데스크톱 앱 접근 허용 |
 | 느리다 | `--beam 1`, `--no-diarize`, 또는 더 작은 Whisper 모델(`--whisper-model`) |
+| Claude 채팅에 Scriptorium 도구가 안 보인다 | Claude Desktop을 트레이에서 완전히 종료 후 다시 열기. `scriptorium setup-claude --dry-run`으로 어느 설정 파일에 등록되는지 확인 |
+| Claude가 만든 노트가 명령줄에서 안 보인다 | 둘 다 0.3.0 이상인지 확인 (`scriptorium version`). 데이터 폴더를 따로 지정했다면 `SCRIPTORIUM_HOME`을 맞출 것 |
 | 실행하자마자 DLL 오류 | 압축을 푼 폴더 구조를 바꾸지 말 것 (`native\`, `app\`, `runtime\`, `models\`가 같은 곳에 있어야 함) |
 
 ---
@@ -433,7 +505,8 @@ scriptorium.cmd ─ runtime\node.exe ─ app\src\cli.js
                                        ├─ speech.js ── sherpa-onnx (ONNX Runtime)
                                        │                 ├ Silero VAD: 말소리 구간 검출
                                        │                 └ pyannote segmentation + 3D-Speaker 임베딩: 화자 분리
-                                       └─ store.js ─── node:sqlite (노트 DB)
+                                       ├─ store.js ─── node:sqlite (노트 DB)
+                                       └─ mcp.js ───── MCP 서버 (stdio JSON-RPC, 도구마다 CLI를 실행)
 ```
 
 1. 오디오를 16 kHz mono로 바꾼다 (파일은 Media Foundation, 녹음은 WASAPI. 마이크와 시스템 오디오는 더해서 [-1, 1]로 자른다)

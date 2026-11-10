@@ -35,11 +35,10 @@ function nativeDir(opts) {
 
 function resolveEnv(opts = {}) {
   const modelsDir = path.resolve(opts['models-dir'] || process.env.SCRIPTORIUM_MODELS || path.join(ROOT, 'models'));
-  const dataDir = path.resolve(
-    opts['data-dir'] ||
-      process.env.SCRIPTORIUM_HOME ||
-      path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'scriptorium'),
-  );
+  // Not under AppData: the Microsoft Store build of Claude Desktop runs MCP servers in its
+  // package container, where AppData writes are redirected to a private copy. A folder in the
+  // user profile is the same for the terminal, Claude chat and Claude Code.
+  const dataDir = path.resolve(opts['data-dir'] || process.env.SCRIPTORIUM_HOME || path.join(os.homedir(), '.scriptorium'));
   const native = nativeDir(opts);
   return {
     dataDir,

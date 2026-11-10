@@ -43,8 +43,11 @@ Notes
   speakers rename <noteId> <SPEAKER_00> <name>
 
 Setup
-  devices                          audio devices and GPUs
+  devices                          audio devices
   doctor                           check that the engine and models are in place
+  setup-claude [--remove] [--dry-run] [--config <file>]
+                                   register Scriptorium with Claude Desktop (then restart Claude)
+  mcp                              run as an MCP server on stdin/stdout (Claude Desktop starts this)
 
 Transcription options (transcribe, record)
   --lang <code|auto>      language, e.g. ko, en (default: auto-detect)
@@ -74,7 +77,7 @@ Record options
   Stops on: --duration, --stop-file, "scriptorium stop", Ctrl+C.
 
 Global options
-  --data-dir <dir>        notes database and recordings (default %APPDATA%\\scriptorium)
+  --data-dir <dir>        notes database and recordings (default %USERPROFILE%\\.scriptorium)
   --models-dir <dir>      model folder (default: models next to scriptorium)
   --whisper-model <file>  a different ggml Whisper model (e.g. a smaller, faster one)
   --quiet                no progress on stderr
@@ -607,6 +610,8 @@ const COMMANDS = {
   speakers: {},
   devices: {},
   doctor: {},
+  'setup-claude': { values: ['config'], booleans: ['remove', 'dry-run'] },
+  mcp: {},
 };
 
 async function main(argv = process.argv.slice(2)) {
@@ -658,6 +663,12 @@ async function main(argv = process.argv.slice(2)) {
         break;
       case 'doctor':
         cmdDoctor(env);
+        break;
+      case 'setup-claude':
+        printJson(require('./claude').setupClaude(env, { configPath: opts.config, remove: opts.remove, dryRun: opts['dry-run'] }));
+        break;
+      case 'mcp':
+        await require('./mcp').serve(opts);
         break;
     }
   } catch (err) {
