@@ -170,7 +170,7 @@ const TOOLS = [
   {
     name: 'scriptorium_list_devices',
     title: 'Audio devices',
-    description: 'Microphones and speakers on this computer, with ids for scriptorium_start_recording, the default of each, and whether Windows has it muted (muted: true). A muted microphone records only silence.',
+    description: 'Microphones and speakers on this computer, with ids for scriptorium_start_recording, the default of each, and for microphones whether Windows has it muted (muted: true), which records only silence. Speakers have no muted field: computer audio is recorded even when the speaker is muted.',
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true },
   },

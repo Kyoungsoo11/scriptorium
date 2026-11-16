@@ -87,7 +87,7 @@ function decodeFile(env, file, { onInfo, onChunk }) {
 
 /**
  * Live microphone + system audio, mixed by scriptorium-core. Emits 'data' (Float32Array), 'started'
- * (with microphoneMuted / systemMuted), 'audio-state' ({event:'mute',source,muted} or
+ * (with microphoneMuted), 'audio-state' ({event:'mute',source:'microphone',muted} or
  * {event:'silent',source:'microphone',silent}), 'warning', 'error', 'end'.
  */
 class Capture extends EventEmitter {

@@ -191,7 +191,9 @@ static std::string deviceId(IMMDevice *d) {
 }
 
 // Windows' mute switch for the endpoint (Sound settings, a mute key, a headset button). A muted
-// endpoint still opens and streams, but every sample is zero. 1 = muted, 0 = not, -1 = unknown.
+// microphone still opens and streams, but every sample is zero. 1 = muted, 0 = not, -1 = unknown.
+// Only read for microphones: loopback taps the mix before the speaker's mute and volume, so a muted
+// speaker still records normally and reporting it only invites a false alarm.
 static int endpointMuted(IMMDevice *d) {
     Com<IAudioEndpointVolume> v;
     if (FAILED(d->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void **)&v))) return -1;
@@ -223,7 +225,8 @@ static int cmdDevices() {
             out += std::string(first ? "" : ",") + "{\"id\":" + jstr(id) + ",\"name\":" + jstr(deviceName(d)) +
                    ",\"input\":" + (flow == eCapture ? "true" : "false") +
                    ",\"output\":" + (flow == eRender ? "true" : "false") +
-                   ",\"default\":" + (id == def ? "true" : "false") + ",\"muted\":" + jmuted(endpointMuted(d)) + "}";
+                   ",\"default\":" + (id == def ? "true" : "false") +
+                   (flow == eCapture ? ",\"muted\":" + jmuted(endpointMuted(d)) : std::string()) + "}";
             first = false;
         }
     }
@@ -312,7 +315,7 @@ struct Source {
     Resampler *rs = nullptr;  // only when the device would not convert for us
     std::deque<float> q;
     bool alive = false;
-    Com<IAudioEndpointVolume> vol;  // for the mute flag; may stay null
+    Com<IAudioEndpointVolume> vol;  // for the microphone's mute flag; null for loopback
     int muted = -1;
     ULONGLONG lastSignal = 0;  // last time a sample above -100 dBFS arrived (any real mic has noise)
     bool silent = false;       // reported as digitally silent
@@ -324,7 +327,7 @@ struct Source {
     }
 
     HRESULT open(IMMDevice *dev) {
-        dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void **)&vol);
+        if (!loopback) dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void **)&vol);
         muted = readMuted();
         HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&client);
         if (FAILED(hr)) return hr;
@@ -443,8 +446,7 @@ static int cmdCapture(const std::wstring &micArg, bool useSystem) {
     }
     logj("{\"event\":\"started\",\"microphone\":" + (useMic ? jstr(micName) : std::string("null")) +
          ",\"system\":" + (useSystem ? jstr(sysName) : std::string("null")) +
-         ",\"microphoneMuted\":" + (useMic ? jmuted(mic.muted) : std::string("null")) +
-         ",\"systemMuted\":" + (useSystem ? jmuted(sys.muted) : std::string("null")) + "}");
+         ",\"microphoneMuted\":" + (useMic ? jmuted(mic.muted) : std::string("null")) + "}");
 
     std::atomic<bool> stop{false};
     std::thread watcher([&] {
@@ -467,16 +469,13 @@ static int cmdCapture(const std::wstring &micArg, bool useSystem) {
         ULONGLONG now = GetTickCount64();
         if (now - lastCheck >= 1000) {
             lastCheck = now;
-            // Mute can be toggled mid-recording; report each change.
-            for (Source *s : {&mic, &sys}) {
-                if (!s->alive) continue;
-                int m = s->readMuted();
-                if (m >= 0 && m != s->muted) {
-                    s->muted = m;
-                    logj(std::string("{\"event\":\"mute\",\"source\":\"") + s->label + "\",\"muted\":" + jmuted(m) + "}");
-                }
-            }
+            // The microphone can be muted mid-recording; report each change.
             if (useMic) {
+                int m = mic.readMuted();
+                if (m >= 0 && m != mic.muted) {
+                    mic.muted = m;
+                    logj(std::string("{\"event\":\"mute\",\"source\":\"microphone\",\"muted\":") + jmuted(m) + "}");
+                }
                 bool silent = now - mic.lastSignal >= SILENT_MS;
                 if (silent != mic.silent) {
                     mic.silent = silent;
