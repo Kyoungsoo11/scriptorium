@@ -71,7 +71,7 @@ const TOOLS = [
     name: 'scriptorium_start_recording',
     title: 'Start recording and transcribing',
     description:
-      'Starts recording in the background and transcribing as it goes; returns the noteId. Captures the default microphone plus whatever the computer is playing, unless told otherwise.',
+      'Starts recording in the background and transcribing as it goes; returns the noteId. Captures the default microphone plus whatever the computer is playing, unless told otherwise. The result has audio.microphoneMuted; if it is true, or `warnings` is present, tell the user at once: a muted microphone records only silence.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -93,7 +93,7 @@ const TOOLS = [
   {
     name: 'scriptorium_list_recordings',
     title: 'Running recordings',
-    description: 'Recordings currently running, with their noteId and elapsed time.',
+    description: 'Recordings currently running, with their noteId, elapsed time and audio state (audio.microphoneMuted, audio.microphoneSilent = 10 s or more of pure digital silence). Relay any `warnings` to the user: the microphone is not being recorded.',
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true },
   },
@@ -170,7 +170,7 @@ const TOOLS = [
   {
     name: 'scriptorium_list_devices',
     title: 'Audio devices',
-    description: 'Microphones and speakers on this computer, with ids for scriptorium_start_recording.',
+    description: 'Microphones and speakers on this computer, with ids for scriptorium_start_recording, the default of each, and whether Windows has it muted (muted: true). A muted microphone records only silence.',
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true },
   },

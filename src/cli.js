@@ -289,6 +289,20 @@ async function cmdRecordDetached(env, opts, argv) {
   throw new Error(`The background recorder did not start; see ${logFile}`);
 }
 
+const MUTED_WARNING =
+  'The microphone is muted in Windows, so it records silence. Unmute it (mic mute key, or Settings > System > Sound > Input).';
+// A muted speaker is not a problem: WASAPI loopback still receives the audio (checked on Realtek).
+const SILENT_WARNING =
+  'The microphone has sent pure digital silence for 10 s: it is muted (mute key or switch) or blocked. Nothing it hears is being recorded.';
+
+/** Human-readable problems for a recording's mute / silence state. */
+function audioWarnings(a) {
+  const w = [];
+  if (a.microphoneMuted) w.push(MUTED_WARNING);
+  else if (a.microphoneSilent) w.push(SILENT_WARNING);
+  return w;
+}
+
 async function cmdRecord(env, opts, argv) {
   if (opts.detach) return cmdRecordDetached(env, opts, argv);
   const log = makeLog(opts);
@@ -344,6 +358,43 @@ async function cmdRecord(env, opts, argv) {
     level.n++;
   });
   capture.on('warning', m => log(`warning: ${m}`));
+
+  // Mute / digital-silence state, kept in the state file so `status` (and the MCP tools) can show it.
+  const audioState = { microphoneMuted: null, systemMuted: null, microphoneSilent: false };
+  let stateReady = false;
+  const writeState = () => {
+    if (!stateReady) return;
+    const warnings = audioWarnings(audioState);
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        pid: process.pid,
+        noteId: run.note?.id ?? null,
+        title,
+        startedAt: startedAt.toISOString(),
+        audioPath: wav?.file ?? null,
+        stopFile,
+        duration,
+        audio: audioState,
+        ...(warnings.length ? { warnings } : {}),
+      }),
+    );
+  };
+  capture.on('started', msg => {
+    audioState.microphoneMuted = msg.microphoneMuted ?? null;
+    audioState.systemMuted = msg.systemMuted ?? null;
+    for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
+  });
+  capture.on('audio-state', msg => {
+    if (msg.event === 'mute') {
+      audioState[msg.source === 'system' ? 'systemMuted' : 'microphoneMuted'] = msg.muted;
+      log(`${msg.source} ${msg.muted ? 'muted' : 'unmuted'}`);
+    } else if (msg.event === 'silent') {
+      audioState.microphoneSilent = msg.silent;
+      log(msg.silent ? `warning: ${SILENT_WARNING}` : 'microphone signal is back');
+    }
+    writeState();
+  });
   capture.on('error', e => {
     log(`capture error: ${e.message}`);
     stop('error');
@@ -377,24 +428,15 @@ async function cmdRecord(env, opts, argv) {
       store?.close();
       throw await run.fail(err);
     }
-    fs.writeFileSync(
-      statePath,
-      JSON.stringify({
-        pid: process.pid,
-        noteId: run.note?.id ?? null,
-        title,
-        startedAt: startedAt.toISOString(),
-        audioPath: wav?.file ?? null,
-        stopFile,
-        duration,
-      }),
-    );
+    stateReady = true;
+    writeState();
     log(`recording "${title}"${duration ? ` for ${duration} s` : ''}; stop with "scriptorium stop" or Ctrl+C`);
     await stopped;
     log(`stopping (${stopReason})`);
   } finally {
     timers.forEach(t => clearTimeout(t));
     await capture.stop();
+    stateReady = false;
   }
 
   try {
