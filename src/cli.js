@@ -291,7 +291,8 @@ async function cmdRecordDetached(env, opts, argv) {
 
 const MUTED_WARNING =
   'The microphone is muted in Windows, so it records silence. Unmute it (mic mute key, or Settings > System > Sound > Input).';
-// A muted speaker is not a problem: WASAPI loopback still receives the audio (checked on Realtek).
+// A muted speaker is not reported at all: WASAPI loopback still receives the audio (checked on Realtek),
+// and a systemMuted flag only made agents warn about a problem that does not exist.
 const SILENT_WARNING =
   'The microphone has sent pure digital silence for 10 s: it is muted (mute key or switch) or blocked. Nothing it hears is being recorded.';
 
@@ -360,7 +361,7 @@ async function cmdRecord(env, opts, argv) {
   capture.on('warning', m => log(`warning: ${m}`));
 
   // Mute / digital-silence state, kept in the state file so `status` (and the MCP tools) can show it.
-  const audioState = { microphoneMuted: null, systemMuted: null, microphoneSilent: false };
+  const audioState = { microphoneMuted: null, microphoneSilent: false };
   let stateReady = false;
   const writeState = () => {
     if (!stateReady) return;
@@ -382,12 +383,11 @@ async function cmdRecord(env, opts, argv) {
   };
   capture.on('started', msg => {
     audioState.microphoneMuted = msg.microphoneMuted ?? null;
-    audioState.systemMuted = msg.systemMuted ?? null;
     for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
   });
   capture.on('audio-state', msg => {
     if (msg.event === 'mute') {
-      audioState[msg.source === 'system' ? 'systemMuted' : 'microphoneMuted'] = msg.muted;
+      audioState.microphoneMuted = msg.muted;
       log(`${msg.source} ${msg.muted ? 'muted' : 'unmuted'}`);
     } else if (msg.event === 'silent') {
       audioState.microphoneSilent = msg.silent;
