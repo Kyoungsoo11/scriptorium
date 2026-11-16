@@ -86,8 +86,9 @@ function decodeFile(env, file, { onInfo, onChunk }) {
 }
 
 /**
- * Live microphone + system audio, mixed by scriptorium-core. Emits 'data' (Float32Array), 'started',
- * 'warning', 'error', 'end'.
+ * Live microphone + system audio, mixed by scriptorium-core. Emits 'data' (Float32Array), 'started'
+ * (with microphoneMuted / systemMuted), 'audio-state' ({event:'mute',source,muted} or
+ * {event:'silent',source:'microphone',silent}), 'warning', 'error', 'end'.
  */
 class Capture extends EventEmitter {
   constructor(env, { mic = 'default', system = true }) {
@@ -108,7 +109,8 @@ class Capture extends EventEmitter {
           started = true;
           this.emit('started', msg);
           resolve(msg);
-        } else if (msg.warning) this.emit('warning', msg.warning);
+        } else if (msg.event === 'mute' || msg.event === 'silent') this.emit('audio-state', msg);
+        else if (msg.warning) this.emit('warning', msg.warning);
         else if (msg.error) {
           lastError = msg.error;
           if (started) this.emit('error', new Error(msg.error));

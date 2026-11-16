@@ -21,6 +21,7 @@
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -189,6 +190,18 @@ static std::string deviceId(IMMDevice *d) {
     return s;
 }
 
+// Windows' mute switch for the endpoint (Sound settings, a mute key, a headset button). A muted
+// endpoint still opens and streams, but every sample is zero. 1 = muted, 0 = not, -1 = unknown.
+static int endpointMuted(IMMDevice *d) {
+    Com<IAudioEndpointVolume> v;
+    if (FAILED(d->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void **)&v))) return -1;
+    BOOL m = FALSE;
+    if (FAILED(v->GetMute(&m))) return -1;
+    return m ? 1 : 0;
+}
+
+static std::string jmuted(int m) { return m < 0 ? "null" : m ? "true" : "false"; }
+
 static int cmdDevices() {
     Com<IMMDeviceEnumerator> en;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en));
@@ -210,7 +223,7 @@ static int cmdDevices() {
             out += std::string(first ? "" : ",") + "{\"id\":" + jstr(id) + ",\"name\":" + jstr(deviceName(d)) +
                    ",\"input\":" + (flow == eCapture ? "true" : "false") +
                    ",\"output\":" + (flow == eRender ? "true" : "false") +
-                   ",\"default\":" + (id == def ? "true" : "false") + "}";
+                   ",\"default\":" + (id == def ? "true" : "false") + ",\"muted\":" + jmuted(endpointMuted(d)) + "}";
             first = false;
         }
     }
@@ -299,8 +312,20 @@ struct Source {
     Resampler *rs = nullptr;  // only when the device would not convert for us
     std::deque<float> q;
     bool alive = false;
+    Com<IAudioEndpointVolume> vol;  // for the mute flag; may stay null
+    int muted = -1;
+    ULONGLONG lastSignal = 0;  // last time a sample above -100 dBFS arrived (any real mic has noise)
+    bool silent = false;       // reported as digitally silent
+
+    int readMuted() {
+        if (!vol) return -1;
+        BOOL m = FALSE;
+        return SUCCEEDED(vol->GetMute(&m)) ? (m ? 1 : 0) : -1;
+    }
 
     HRESULT open(IMMDevice *dev) {
+        dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void **)&vol);
+        muted = readMuted();
         HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void **)&client);
         if (FAILED(hr)) return hr;
         DWORD flags = loopback ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
@@ -368,6 +393,11 @@ struct Source {
                     mono[i] = s / channels;
                 }
             }
+            // A muted Realtek array sends ~1e-8 (-157 dBFS), not exact zeros; anything under
+            // -100 dBFS is below one 16-bit step and no real microphone's noise floor is that low.
+            for (float v : mono) {
+                if (std::fabs(v) > 1e-5f) { lastSignal = GetTickCount64(); break; }
+            }
             cap->ReleaseBuffer(frames);
             if (rs) {
                 conv.clear();
@@ -412,7 +442,9 @@ static int cmdCapture(const std::wstring &micArg, bool useSystem) {
         }
     }
     logj("{\"event\":\"started\",\"microphone\":" + (useMic ? jstr(micName) : std::string("null")) +
-         ",\"system\":" + (useSystem ? jstr(sysName) : std::string("null")) + "}");
+         ",\"system\":" + (useSystem ? jstr(sysName) : std::string("null")) +
+         ",\"microphoneMuted\":" + (useMic ? jmuted(mic.muted) : std::string("null")) +
+         ",\"systemMuted\":" + (useSystem ? jmuted(sys.muted) : std::string("null")) + "}");
 
     std::atomic<bool> stop{false};
     std::thread watcher([&] {
@@ -425,11 +457,34 @@ static int cmdCapture(const std::wstring &micArg, bool useSystem) {
     watcher.detach();
 
     const size_t MAX_SYS_BACKLOG = SR / 2;  // drop system audio that falls more than 0.5 s behind
-    ULONGLONG start = GetTickCount64();
+    const ULONGLONG SILENT_MS = 10000;  // a live microphone never sends 10 s under -100 dBFS
+    ULONGLONG start = GetTickCount64(), lastCheck = start;
+    mic.lastSignal = start;
     unsigned long long emitted = 0;
     std::vector<float> out;
     while (!stop) {
         Sleep(10);
+        ULONGLONG now = GetTickCount64();
+        if (now - lastCheck >= 1000) {
+            lastCheck = now;
+            // Mute can be toggled mid-recording; report each change.
+            for (Source *s : {&mic, &sys}) {
+                if (!s->alive) continue;
+                int m = s->readMuted();
+                if (m >= 0 && m != s->muted) {
+                    s->muted = m;
+                    logj(std::string("{\"event\":\"mute\",\"source\":\"") + s->label + "\",\"muted\":" + jmuted(m) + "}");
+                }
+            }
+            if (useMic) {
+                bool silent = now - mic.lastSignal >= SILENT_MS;
+                if (silent != mic.silent) {
+                    mic.silent = silent;
+                    logj(std::string("{\"event\":\"silent\",\"source\":\"microphone\",\"silent\":") +
+                         (silent ? "true" : "false") + "}");
+                }
+            }
+        }
         if (useMic && !mic.poll()) return fail("the microphone stopped (device removed?)");
         if (useSystem && !sys.poll()) {
             logj("{\"warning\":\"system audio stopped, continuing with the microphone\"}");

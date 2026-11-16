@@ -1,0 +1,30 @@
+// Icon and version info for scriptorium-core.exe. Windows shows these wherever the process is
+// listed: the microphone-in-use indicator, Settings > Privacy > Microphone, Task Manager.
+#include <winver.h>
+
+1 ICON "scriptorium.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,3,1,0
+PRODUCTVERSION 0,3,1,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Scriptorium"
+            VALUE "FileDescription", "Scriptorium"
+            VALUE "FileVersion", "0.3.1"
+            VALUE "InternalName", "scriptorium-core"
+            VALUE "OriginalFilename", "scriptorium-core.exe"
+            VALUE "ProductName", "Scriptorium"
+            VALUE "ProductVersion", "0.3.1"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
