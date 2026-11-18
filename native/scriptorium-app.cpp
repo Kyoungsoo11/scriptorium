@@ -1230,6 +1230,25 @@ void onCommand(UINT id, UINT code) {
     }
 }
 
+// ---- run\app.json -------------------------------------------------------------------------------
+
+/**
+ * <data>\run\app.json says this app runs (src/tray.js reads it): recorders and transcriptions
+ * start the app with --background while it is missing, so the tray icon is always there.
+ */
+std::wstring appFilePath() { return joinPath(g.paths.runDir, L"app.json"); }
+
+void writeAppFile() {
+    makeDirs(g.paths.runDir);
+    writeFileAtomic(appFilePath(), "{\"pid\":" + std::to_string(GetCurrentProcessId()) + "}\n");
+}
+
+void removeAppFile() {
+    Json j;
+    if (parseJson(readFile(appFilePath()), j) && (DWORD)j.number(L"pid") == GetCurrentProcessId())
+        DeleteFileW(appFilePath().c_str());
+}
+
 // ---- probe ------------------------------------------------------------------------------------
 
 void writeProbe() {
@@ -1427,6 +1446,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ChangeWindowMessageFilterEx(g.wnd, g.showMessage, MSGFLT_ALLOW, nullptr);
 
     addTrayIcon();
+    if (!g.probe) writeAppFile();
     loadSettings();
     createForm();
     poll();  // builds the window's content and sizes it
@@ -1443,6 +1463,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     for (HICON i : g.trayIcons)
         if (i) DestroyIcon(i);
+    if (!g.probe) removeAppFile();
     if (mutex) CloseHandle(mutex);
     return 0;
 }

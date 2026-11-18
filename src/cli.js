@@ -15,6 +15,7 @@ const { decodeFile, Capture, listDevices } = require('./native');
 const { TranscriptionRun } = require('./transcriber');
 const { render, fromAltEntries, FORMATS } = require('./format');
 const { writeJsonAtomic, writeFinished, TranscribeState } = require('./activity');
+const { keepTrayApp } = require('./tray');
 
 const VERSION = require('../package.json').version;
 
@@ -670,6 +671,16 @@ function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
 
 // ---- app ---------------------------------------------------------------------
 
+/** Runs work with the tray app kept running, so its icon shows however the work was started. */
+async function withTrayApp(env, work) {
+  const stop = keepTrayApp(env);
+  try {
+    return await work();
+  } finally {
+    stop();
+  }
+}
+
 /**
  * Starts the tray app, or brings the running one forward (it allows one instance per session).
  * The app watches env.dataDir, so a --data-dir given here reaches it too.
@@ -770,10 +781,12 @@ async function main(argv = process.argv.slice(2)) {
     const env = resolveEnv(opts);
     switch (command) {
       case 'transcribe':
-        await cmdTranscribe(env, opts, positionals);
+        await withTrayApp(env, () => cmdTranscribe(env, opts, positionals));
         break;
       case 'record':
-        await cmdRecord(env, opts, rest);
+        // --detach only starts the recorder, which then keeps the app itself
+        if (opts.detach) await cmdRecord(env, opts, rest);
+        else await withTrayApp(env, () => cmdRecord(env, opts, rest));
         break;
       case 'stop':
         await cmdStop(env, opts);
