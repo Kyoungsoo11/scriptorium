@@ -187,11 +187,21 @@ async function cmdTranscribe(env, opts, files) {
   const results = [];
   // Shown by the tray app while this runs.
   const activity = new TranscribeState(env, { count: files.length });
+  // Ctrl+C or a kill from MCP: leave no state file behind and say the file did not finish.
+  let current = null;
+  const onSignal = () => {
+    activity.close();
+    if (current) writeFinished(env, { kind: 'transcribe', ...current, ok: false, error: 'interrupted' });
+    process.exit(130);
+  };
+  const signals = ['SIGINT', 'SIGTERM', 'SIGBREAK'];
+  signals.forEach(s => process.on(s, onSignal));
   try {
     for (const [index, file] of files.entries()) {
       const abs = path.resolve(file);
       if (!fs.existsSync(abs)) throw new UsageError(`No such file: ${file}`);
       const title = opts.title || path.parse(abs).name;
+      current = { id: `${process.pid}-${index}`, title };
       let total = null;
       const run = new TranscriptionRun({
         env,
@@ -227,24 +237,20 @@ async function cmdTranscribe(env, opts, files) {
         result.sourcePath = abs;
         result.elapsedSeconds = Math.round((Date.now() - started) / 100) / 10;
         log(`done: ${result.segments.length} segments, ${result.speakers.length} speakers, ${result.elapsedSeconds} s`);
-        writeFinished(env, { kind: 'transcribe', id: `${process.pid}-${index}`, title, ok: true, noteId: result.noteId });
         deliver(result, opts, { stream, title });
+        writeFinished(env, { kind: 'transcribe', ...current, ok: true, noteId: result.noteId });
+        current = null;
         results.push(result);
       } catch (err) {
         clearInterval(progress);
         clearInterval(ticker);
-        writeFinished(env, {
-          kind: 'transcribe',
-          id: `${process.pid}-${index}`,
-          title,
-          ok: false,
-          noteId: run.note?.id ?? null,
-          error: err.message,
-        });
+        writeFinished(env, { kind: 'transcribe', ...current, ok: false, noteId: run.note?.id ?? null, error: err.message });
+        current = null;
         throw await run.fail(err);
       }
     }
   } finally {
+    signals.forEach(s => process.off(s, onSignal));
     activity.close();
     store?.close();
   }
@@ -288,6 +294,17 @@ function runningRecordings(env) {
 }
 
 async function cmdRecordDetached(env, opts, argv) {
+  // Check the options here, so a mistake is reported directly instead of as "did not start".
+  const options = transcriptionOptions(opts);
+  if (opts.duration) {
+    try {
+      parseDuration(opts.duration);
+    } catch (e) {
+      throw new UsageError(e.message);
+    }
+  }
+  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
+  requireModels(env, options);
   fs.mkdirSync(env.runDir, { recursive: true });
   const logFile = opts['log-file'] ? path.resolve(opts['log-file']) : path.join(env.runDir, `record-${Date.now()}.log`);
   const args = ['record', ...argv.filter(a => a !== '--detach' && a !== '--stream')];
@@ -310,7 +327,15 @@ async function cmdRecordDetached(env, opts, argv) {
     }
     if (!alive(child.pid)) break;
   }
-  throw new Error(`The background recorder did not start; see ${logFile}`);
+  // The recorder's own error line, when it wrote one, says more than "did not start".
+  let reason = '';
+  try {
+    const lines = fs.readFileSync(logFile, 'utf8').split(/\r?\n/).filter(l => l.startsWith('scriptorium: '));
+    if (lines.length) reason = `: ${lines[lines.length - 1].slice('scriptorium: '.length)}`;
+  } catch {
+    // no log
+  }
+  throw new Error(`The background recorder did not start${reason} (log: ${logFile})`);
 }
 
 const MUTED_WARNING =
@@ -389,9 +414,18 @@ async function cmdRecord(env, opts, argv) {
   const audioState = { microphoneMuted: null, microphoneSilent: false };
   let stateReady = false;
   let phase = 'recording';
+  // Never throws: it runs inside capture event handlers, and a failed status update must not stop
+  // the recording (writeJsonAtomic already retries while a reader holds the file).
   const writeState = () => {
     if (!stateReady) return;
     const warnings = audioWarnings(audioState);
+    try {
+      writeStateFile(warnings);
+    } catch (e) {
+      log(`warning: could not update ${statePath}: ${e.message}`);
+    }
+  };
+  const writeStateFile = warnings =>
     writeJsonAtomic(statePath, {
       kind: 'recording',
       phase,
@@ -405,7 +439,6 @@ async function cmdRecord(env, opts, argv) {
       audio: audioState,
       ...(warnings.length ? { warnings } : {}),
     });
-  };
   const finished = (ok, extra) =>
     writeFinished(env, { kind: 'recording', id, title, ok, noteId: run.note?.id ?? null, ...extra });
   capture.on('started', msg => {
@@ -477,12 +510,12 @@ async function cmdRecord(env, opts, argv) {
     result.audioPath = audio?.path ?? null;
     result.startedAt = startedAt.toISOString();
     result.stopReason = stopReason;
+    deliver(result, opts, { stream, title });
     // A capture error still saves what was recorded, but the notice should say it went wrong.
     finished(stopReason !== 'error', {
       audioPath: result.audioPath,
       ...(stopReason === 'error' ? { error: 'audio capture failed; what was recorded until then is saved' } : {}),
     });
-    deliver(result, opts, { stream, title });
     if (stopReason === 'error') process.exitCode = 1;
   } catch (err) {
     finished(false, { error: err.message });
@@ -641,11 +674,16 @@ function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
  * Starts the tray app, or brings the running one forward (it allows one instance per session).
  * The app watches env.dataDir, so a --data-dir given here reaches it too.
  */
-function cmdApp(env) {
+async function cmdApp(env) {
   if (!fs.existsSync(env.appExe)) {
     throw new Error(`The tray app is missing: ${env.appExe}. Build it with scripts\\build-app.cmd.`);
   }
   const child = spawn(env.appExe, ['--data-dir', env.dataDir], { detached: true, stdio: 'ignore' });
+  // e.g. blocked by an application control policy: report it rather than print a pid
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve);
+    child.once('error', e => reject(new Error(`Could not start the tray app ${env.appExe}: ${e.message}`)));
+  });
   child.unref();
   printJson({ app: env.appExe, pid: child.pid });
 }
@@ -753,7 +791,7 @@ async function main(argv = process.argv.slice(2)) {
         cmdSpeakers(env, opts, positionals);
         break;
       case 'app':
-        cmdApp(env);
+        await cmdApp(env);
         break;
       case 'devices':
         cmdDevices(env);

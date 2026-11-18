@@ -6,18 +6,53 @@
 //   recording-<id>.stop            asks that recording to stop (written by `stop` and the tray app)
 //   transcribe-<pid>.json          a file transcription in progress, with progress in seconds
 //   finished-<kind>-<id>.json      one piece of work that ended (ok or not); the tray app shows a
-//                                  notice and deletes it. Old ones are cleaned up by the app.
+//                                  notice and deletes it. Notices older than a week are pruned.
 //
 // Files are written whole (temporary file + rename) so a reader never sees half of one.
 
 const fs = require('node:fs');
 const path = require('node:path');
 
+const NOTICE_TTL_MS = 7 * 24 * 3600 * 1000;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Writes JSON through a temporary file and a rename. On Windows the rename fails (EPERM, EBUSY,
+ * EACCES) while another process has the target open, which the tray app does every second to
+ * read it, so it is retried for up to about a second before giving up.
+ */
 function writeJsonAtomic(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data));
-  fs.renameSync(tmp, file);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (e) {
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(e.code) || attempt >= 20) {
+        fs.rmSync(tmp, { force: true });
+        throw e;
+      }
+      sleepSync(50);
+    }
+  }
+}
+
+function pruneOldNotices(runDir) {
+  const now = Date.now();
+  for (const f of fs.readdirSync(runDir)) {
+    if (!f.startsWith('finished-') || !f.endsWith('.json')) continue;
+    const file = path.join(runDir, f);
+    try {
+      if (now - fs.statSync(file).mtimeMs > NOTICE_TTL_MS) fs.rmSync(file, { force: true });
+    } catch {
+      // another process took it
+    }
+  }
 }
 
 /** Records that a recording or transcription ended. Never throws: the work itself is done. */
@@ -34,6 +69,8 @@ function writeFinished(env, { kind, id, title, ok, noteId = null, error = null, 
       ...(audioPath ? { audioPath } : {}),
       endedAt: new Date().toISOString(),
     });
+    // with no tray app running nothing consumes them
+    pruneOldNotices(env.runDir);
   } catch {
     // a notice is nice to have; never let it fail the run
   }

@@ -34,8 +34,9 @@ using namespace app;
 
 namespace {
 
-constexpr wchar_t kMutexName[] = L"Local\\Scriptorium.App";
-constexpr wchar_t kWindowClass[] = L"Scriptorium.App";
+// One app per data folder: the names get a hash of the folder appended (see instanceSuffix).
+constexpr wchar_t kMutexPrefix[] = L"Local\\Scriptorium.App.";
+constexpr wchar_t kClassPrefix[] = L"Scriptorium.App.";
 constexpr wchar_t kProbeClass[] = L"Scriptorium.App.Probe";
 constexpr wchar_t kShowMessageName[] = L"Scriptorium.App.Show";
 constexpr UINT kTrayId = 1;
@@ -47,7 +48,7 @@ enum MenuId : UINT {
     ID_STOP_ALL,
     ID_EXIT,
     ID_STOP_FIRST = 1000,  // + index into the menu's snapshot of recordings
-    ID_ROW_FIRST = 2000,   // window rows: + row * kRowIds + {title, status, stop}
+    ID_ROW_FIRST = 10000,  // window rows: + row * kRowIds + {title, status, stop}; above every other id
 };
 constexpr UINT kRowIds = 4;
 constexpr UINT ID_EMPTY = 1900;
@@ -98,6 +99,24 @@ std::wstring findOnPath(const wchar_t *exe) {
  * Packaged:     <root>\Scriptorium.exe, <root>\runtime\node.exe, <root>\app\bin\scriptorium.js
  * Development:  <repo>\build\app\Scriptorium.exe, node on PATH, <repo>\bin\scriptorium.js
  */
+/**
+ * One app per data folder: a hash of the folder (case-insensitive, no trailing slash) for the
+ * mutex and window class names, so `scriptorium app --data-dir X` gets its own app for X.
+ */
+std::wstring instanceSuffix(const std::wstring &dataDir) {
+    std::wstring d = dataDir;
+    while (d.size() > 3 && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+    CharLowerBuffW(d.data(), (DWORD)d.size());
+    unsigned long long h = 1469598103934665603ULL;  // FNV-1a
+    for (wchar_t c : d) {
+        h ^= (unsigned long long)c;
+        h *= 1099511628211ULL;
+    }
+    wchar_t buf[17];
+    swprintf_s(buf, L"%016llx", h);
+    return buf;
+}
+
 Paths resolvePaths(const std::wstring &dataDirArg) {
     Paths p;
     std::wstring exeDir = parentDir(exePath());
@@ -216,6 +235,8 @@ struct App {
     std::vector<Row> rows;
     std::wstring rowsShape = L"\x1";  // keys + stop-button visibility the rows were built for (none yet)
     HWND runningHeader = nullptr, emptyLabel = nullptr;
+    HWND lastFocus = nullptr;  // focused control when the window was last deactivated
+    bool modal = false;        // a message box is open
 } g;
 
 UINT windowDpi() { return g.wnd ? GetDpiForWindow(g.wnd) : 96; }
@@ -223,6 +244,17 @@ int scaled(int px, UINT dpi) { return MulDiv(px, (int)dpi, 96); }
 int S(int px) { return scaled(px, windowDpi()); }
 
 bool busy() { return !g.activities.empty(); }
+
+enum RowPart { ROW_TITLE = 0, ROW_STATUS = 1, ROW_STOP = 2 };
+
+/** Which part of a window row a control id is (ROW_*), with the row; -1 for any other control. */
+int rowPart(UINT id, size_t *row) {
+    if (id < ID_ROW_FIRST) return -1;
+    size_t r = (id - ID_ROW_FIRST) / kRowIds;
+    if (r >= g.rows.size()) return -1;
+    *row = r;
+    return (int)((id - ID_ROW_FIRST) % kRowIds);
+}
 
 int liveRecordings() {
     return (int)std::count_if(g.activities.begin(), g.activities.end(), [](const Activity &a) { return a.live(); });
@@ -346,7 +378,8 @@ void setTray(TrayState state, const std::wstring &tip) {
     g.tip = tip;
     NOTIFYICONDATAW nid = trayData(0);
     fillTrayLook(nid);
-    if (!g.trayAdded || !Shell_NotifyIconW(NIM_MODIFY, &nid)) addTrayIcon();
+    if (Shell_NotifyIconW(NIM_MODIFY, &nid)) g.trayAdded = true;  // also when NIM_ADD timed out but worked
+    else addTrayIcon();
 }
 
 void removeTrayIcon() {
@@ -427,6 +460,7 @@ std::wstring statusText(const Activity &a, bool *warn) {
 int layoutForm(int m, int y, int w);
 void requestLists();
 void poll();
+void restoreFocus();
 
 /** Height of the client area; positions every control: running work on top, the new-recording form below. */
 int layout() {
@@ -466,8 +500,11 @@ void fitWindow() {
     if (wr.right - wr.left != frameW) SetWindowPos(g.wnd, nullptr, 0, 0, frameW, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     int h = layout() + frameExtraH;
     GetWindowRect(g.wnd, &wr);
-    if (wr.bottom - wr.top != h)
-        SetWindowPos(g.wnd, nullptr, wr.left, wr.bottom - h, frameW, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    int top = std::max<int>(wr.bottom - h, mi.rcWork.top);  // keep the title bar on screen
+    if (wr.bottom - wr.top != h || wr.top != top)
+        SetWindowPos(g.wnd, nullptr, wr.left, top, frameW, h, SWP_NOZORDER | SWP_NOACTIVATE);
     layout();
     // Moved controls leave their old pixels behind otherwise (WS_CLIPCHILDREN keeps the parent
     // from painting under them while they move).
@@ -484,6 +521,9 @@ void refreshRows() {
         g.emptyLabel = makeChild(L"STATIC", L"진행 중인 작업이 없어요", SS_LEFT | SS_NOPREFIX, ID_EMPTY, g.font);
     }
     if (shape != g.rowsShape) {
+        HWND focus = GetFocus();
+        bool rowHadFocus = false;
+        for (const Row &r : g.rows) rowHadFocus |= focus && (focus == r.stop || focus == r.title || focus == r.status);
         for (Row &r : g.rows) {
             DestroyWindow(r.title);
             DestroyWindow(r.status);
@@ -502,6 +542,7 @@ void refreshRows() {
         }
         ShowWindow(g.emptyLabel, g.rows.empty() ? SW_SHOW : SW_HIDE);
         g.rowsShape = shape;
+        if (rowHadFocus) restoreFocus();  // its 정지 button is gone
         fitWindow();
     }
     for (size_t i = 0; i < g.rows.size(); i++) {
@@ -538,6 +579,7 @@ void showWindow() {
     ShowWindow(g.wnd, SW_SHOW);
     if (IsIconic(g.wnd)) ShowWindow(g.wnd, SW_RESTORE);
     SetForegroundWindow(g.wnd);
+    g.idleSince = 0;
 }
 
 void openDataFolder() {
@@ -567,7 +609,15 @@ struct Form {
     bool starting = false;
     bool listsLoading = false;
     Settings settings;
+    bool listsLoaded = false;  // the microphone list came back at least once
 } form;
+
+/** Focus for the window when it becomes active: the control that had it, else the title field. */
+void restoreFocus() {
+    HWND h = g.lastFocus;
+    if (!h || !IsWindow(h) || !IsChild(g.wnd, h) || !IsWindowVisible(h) || !IsWindowEnabled(h)) h = form.title;
+    if (h) SetFocus(h);
+}
 
 const wchar_t *kLanguages[][2] = {{L"ko", L"한국어"}, {L"en", L"영어"}, {L"auto", L"자동 감지"}};
 const wchar_t *kSources[] = {L"마이크 + 컴퓨터 소리", L"컴퓨터 소리만", L"마이크만"};
@@ -774,8 +824,10 @@ void requestLists() {
 void applyLists(std::unique_ptr<Lists> lists) {
     form.listsLoading = false;
     if (lists->devicesOk) {
-        std::wstring current = form.micIds[std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0))];
-        if (form.micIds.size() == 1) current = form.settings.mic;  // first load: the saved choice
+        int cur = std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0));
+        std::wstring current = cur < (int)form.micIds.size() ? form.micIds[cur] : L"default";
+        if (!form.listsLoaded) current = form.settings.mic;  // first load: the saved choice
+        form.listsLoaded = true;
         SendMessageW(form.mic, CB_RESETCONTENT, 0, 0);
         form.micIds = {L"default"};
         std::wstring def = lists->defaultMic.empty() ? L"기본 마이크" : L"기본 마이크 (" + lists->defaultMic + L")";
@@ -800,7 +852,7 @@ void applyLists(std::unique_ptr<Lists> lists) {
 
 struct StartResult {
     bool ok = false;
-    std::wstring title, message;
+    std::wstring title, typed, message;
 };
 
 /** "Recording 2026-11-18 14:30", like the CLI's default, plus " (2)" if that title is already running. */
@@ -831,14 +883,17 @@ std::wstring cliError(const RunResult &r) {
 void startRecording() {
     if (form.starting) return;
     if (!cliReady()) {
-        setFormStatus(L"Scriptorium 명령줄 도구를 찾지 못했어요: " + (fileExists(g.paths.node) ? g.paths.cli : g.paths.node), true);
+        std::wstring what = !fileExists(g.paths.node) ? (g.paths.node.empty() ? L"node.exe (PATH에 없음)" : g.paths.node)
+                                                      : g.paths.cli;
+        setFormStatus(L"Scriptorium 명령줄 도구를 찾지 못했어요: " + what, true);
         return;
     }
-    std::wstring title = windowText(form.title);
-    if (title.empty()) title = defaultTitle();
+    std::wstring typed = windowText(form.title);
+    std::wstring title = typed.empty() ? defaultTitle() : typed;
     int source = std::max(0, (int)SendMessageW(form.source, CB_GETCURSEL, 0, 0));
     int micSel = std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0));
     std::wstring micId = micSel < (int)form.micIds.size() ? form.micIds[micSel] : L"default";
+    if (!form.listsLoaded) micId = form.settings.mic;  // the list (with the saved choice) has not arrived yet
     int langSel = std::clamp((int)SendMessageW(form.lang, CB_GETCURSEL, 0, 0), 0, (int)std::size(kLanguages) - 1);
     std::wstring folder = windowText(form.folder);
     bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
@@ -867,9 +922,10 @@ void startRecording() {
     setFormStatus(L"녹음을 준비하는 중… (음성 인식 모델을 불러오느라 몇 초 걸려요)", false);
 
     HWND wnd = g.wnd;
-    std::thread([wnd, args, title] {
+    std::thread([wnd, args, title, typed] {
         auto *res = new StartResult();
         res->title = title;
+        res->typed = typed;
         // `record --detach` returns once the recorder runs (it waits up to 90 s for that)
         RunResult r = runAndCapture(args, 120000);
         res->ok = r.started && r.exitCode == 0;
@@ -883,7 +939,8 @@ void onStartDone(std::unique_ptr<StartResult> res) {
     form.starting = false;
     updateFormEnabled();
     if (res->ok) {
-        SetWindowTextW(form.title, L"");  // the next recording gets its own title
+        // the next recording gets its own title, unless one was typed while this one started
+        if (windowText(form.title) == res->typed) SetWindowTextW(form.title, L"");
         setFormStatus(L"'" + res->title + L"' 녹음을 시작했어요", false);
         SetTimer(g.wnd, TIMER_CLEAR_STATUS, 6000, nullptr);
     } else {
@@ -893,6 +950,21 @@ void onStartDone(std::unique_ptr<StartResult> res) {
 }
 
 // ---- reading the run folder ------------------------------------------------------------
+
+/**
+ * True when `pid` belongs to a process created after the work began: the writer died and Windows
+ * reused its pid (a killed transcription leaves its file behind). The writer itself always
+ * starts before it records startedAt; a minute of slack covers clock adjustments.
+ */
+bool startedAfter(DWORD pid, ULONGLONG startedMs) {
+    if (!startedMs) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    FILETIME created, exited, kernel, user;
+    bool ok = GetProcessTimes(h, &created, &exited, &kernel, &user) != FALSE;
+    CloseHandle(h);
+    return ok && fileTimeEpochMs(created) > startedMs + 60000;
+}
 
 bool readActivity(const std::wstring &file, const std::wstring &key, Activity &a) {
     bool ok = false;
@@ -942,7 +1014,7 @@ std::vector<Finished> scanRunDir() {
             if (key.rfind(L"recording-", 0) == 0 || key.rfind(L"transcribe-", 0) == 0) {
                 Activity a;
                 if (!readActivity(file, key, a)) continue;  // being written, or not ours
-                if (!processAlive(a.pid)) {
+                if (!processAlive(a.pid) || startedAfter(a.pid, a.startedMs)) {
                     // its process died without cleaning up (as `status` does); a probe only looks
                     if (!g.probe) {
                         DeleteFileW(file.c_str());
@@ -1020,7 +1092,9 @@ std::wstring tooltipText() {
 
 /** Background mode (and "종료" while busy) ends by itself a little while after the last piece of work. */
 void checkIdleExit() {
-    if ((g.resident && !g.exitWhenIdle) || g.probe || busy()) {
+    // a start in flight, an open window or an open prompt keeps the app
+    bool inUse = form.starting || g.modal || IsWindowVisible(g.wnd);
+    if ((g.resident && !g.exitWhenIdle) || g.probe || busy() || inUse) {
         g.idleSince = 0;
         return;
     }
@@ -1030,6 +1104,7 @@ void checkIdleExit() {
 }
 
 void poll() {
+    if (!IsWindow(g.wnd)) return;
     std::vector<Finished> finished = scanRunDir();
     announce(finished);
     warnAboutMicrophones();
@@ -1057,18 +1132,35 @@ void stopAllRecordings() {
  * "종료": quits at once when nothing runs. Otherwise the tray icon has to stay while work runs, so
  * it offers to stop the recordings and quit once everything has finished.
  */
+int modalBox(const std::wstring &text, UINT flags) {
+    g.modal = true;
+    int r = MessageBoxW(g.wnd, text.c_str(), L"Scriptorium 종료", flags | MB_SETFOREGROUND);
+    g.modal = false;
+    return r;
+}
+
 void requestExit() {
+    if (form.starting) {
+        // the recorder is about to start; quitting now would leave it running with no icon
+        modalBox(L"녹음을 시작하는 중이에요. 시작된 뒤에 다시 종료해 주세요.", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     if (!busy()) {
         DestroyWindow(g.wnd);
         return;
     }
-    int rec = liveRecordings(), other = (int)g.activities.size() - rec;
+    int live = liveRecordings(), finishing = 0, files = 0;
+    for (const Activity &a : g.activities) {
+        if (a.recording && !a.live()) finishing++;
+        else if (!a.recording) files++;
+    }
     std::wstring text;
-    if (rec) text = L"녹음 " + std::to_wstring(rec) + L"개를 정지하고, ";
-    text += L"진행 중인 전사가 모두 끝나면 Scriptorium을 종료할까요?\n\n전사가 끝날 때까지는 트레이 아이콘이 남아 있어요.";
-    if (!rec && other) text = L"진행 중인 파일 전사 " + std::to_wstring(other) + L"개가 끝나면 Scriptorium을 종료할까요?";
-    if (MessageBoxW(g.wnd, text.c_str(), L"Scriptorium 종료", MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND) != IDOK)
-        return;
+    if (live) text = L"녹음 " + std::to_wstring(live) + L"개를 정지하고, ";
+    std::wstring waits;
+    if (live || finishing) waits = L"녹음 전사";
+    if (files) waits += (waits.empty() ? L"" : L"와 ") + std::wstring(L"파일 전사 ") + std::to_wstring(files) + L"개";
+    text += waits + L"가 모두 끝나면 Scriptorium을 종료할까요?\n\n그때까지는 트레이 아이콘이 남아 있어요.";
+    if (modalBox(text, MB_OKCANCEL | MB_ICONQUESTION) != IDOK || !IsWindow(g.wnd)) return;
     stopAllRecordings();
     g.exitWhenIdle = true;
     ShowWindow(g.wnd, SW_HIDE);
@@ -1110,8 +1202,8 @@ void onCommand(UINT id, UINT code) {
         poll();
         return;
     }
-    if (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 2) {  // a row's 정지 button
-        size_t row = (id - ID_ROW_FIRST) / kRowIds;
+    size_t row = 0;
+    if (rowPart(id, &row) == ROW_STOP) {  // a row's 정지 button
         if (row < g.activities.size() && g.activities[row].live()) stopRecording(g.activities[row].key);
         poll();
         return;
@@ -1217,10 +1309,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         COLORREF color = GetSysColor(COLOR_WINDOWTEXT);
         if (id == ID_EMPTY) color = GetSysColor(COLOR_GRAYTEXT);
         else if (id == ID_FORM_STATUS) color = form.statusError ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
-        else if (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 1) {
-            size_t row = (id - ID_ROW_FIRST) / kRowIds;
-            color = row < g.rows.size() && g.rows[row].warn ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
-        }
+        else if (size_t row = 0; rowPart(id, &row) == ROW_STATUS)
+            color = g.rows[row].warn ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
         SetTextColor(dc, color);
         return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     }
@@ -1233,12 +1323,21 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ensureFonts();
         for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
             UINT id = (UINT)GetDlgCtrlID(c);
-            bool bold = id == ID_RUNNING_HEADER || id == ID_NEW_HEADER || (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 0);
+            size_t row = 0;
+            bool bold = id == ID_RUNNING_HEADER || id == ID_NEW_HEADER || rowPart(id, &row) == ROW_TITLE;
             SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(bold ? g.boldFont : g.font), TRUE);
         }
         fitWindow();
         return 0;
     }
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) {
+            HWND focus = GetFocus();
+            if (focus && IsChild(hwnd, focus)) g.lastFocus = focus;
+        } else {
+            restoreFocus();
+        }
+        return 0;
     case WM_LISTS_LOADED:
         applyLists(std::unique_ptr<Lists>(reinterpret_cast<Lists *>(lp)));
         return 0;
@@ -1282,14 +1381,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.paths = resolvePaths(dataDirArg);
 
     g.showMessage = RegisterWindowMessageW(kShowMessageName);
+    const std::wstring windowClass = kClassPrefix + instanceSuffix(g.paths.dataDir);
     // A probe runs alongside a real instance, so it skips the single-instance check.
     HANDLE mutex = nullptr;
     if (!g.probe) {
-        mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+        mutex = CreateMutexW(nullptr, TRUE, (kMutexPrefix + instanceSuffix(g.paths.dataDir)).c_str());
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             // Background launches only make sure the app runs; a user launch brings it forward.
             if (!background) {
-                if (HWND other = FindWindowW(kWindowClass, nullptr)) {
+                if (HWND other = FindWindowW(windowClass.c_str(), nullptr)) {
                     DWORD pid = 0;
                     GetWindowThreadProcessId(other, &pid);
                     AllowSetForegroundWindow(pid);
@@ -1312,7 +1412,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                                GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = g.probe ? kProbeClass : kWindowClass;
+    wc.lpszClassName = g.probe ? kProbeClass : windowClass.c_str();
     RegisterClassExW(&wc);
 
     g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");

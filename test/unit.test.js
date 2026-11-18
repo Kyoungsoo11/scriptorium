@@ -135,3 +135,37 @@ test('activity files: transcribe state is written whole and removed, finished no
   writeFinished({ runDir: path.join(dir, 'run', files[0]) }, { kind: 'transcribe', id: 1, title: 't', ok: true });
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('writeJsonAtomic waits out a reader that holds the file open (Windows rename EPERM)', async () => {
+  const { spawn } = require('node:child_process');
+  const { writeJsonAtomic } = require('../src/activity');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-atomic-'));
+  const file = path.join(dir, 'recording-x.json');
+  fs.writeFileSync(file, '{"v":0}');
+  // another process opens the file (as the tray app does every second) and keeps it for 300 ms
+  const holder = spawn(process.execPath, [
+    '-e',
+    `const fs=require('fs');const fd=fs.openSync(${JSON.stringify(file)},'r');process.stdout.write('open');setTimeout(()=>fs.closeSync(fd),300);`,
+  ]);
+  await new Promise(r => holder.stdout.once('data', r));
+  writeJsonAtomic(file, { v: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { v: 1 });
+  assert.deepEqual(fs.readdirSync(dir), ['recording-x.json']);
+  await new Promise(r => holder.once('exit', r));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('record --detach rejects a bad option before starting anything', () => {
+  const { spawnSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-detach-'));
+  const cli = path.join(__dirname, '..', 'bin', 'scriptorium.js');
+  const run = (...args) => spawnSync(process.execPath, [cli, 'record', '--detach', '--data-dir', dir, ...args], { encoding: 'utf8' });
+  let r = run('--duration', 'soon');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /soon/);
+  r = run('--mic', 'none', '--no-system');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /Nothing to record/);
+  assert.equal(fs.existsSync(path.join(dir, 'run')), false, 'no recorder was started');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
