@@ -2,13 +2,16 @@
 'use strict';
 // Builds the distributable folder and zip:
 //   dist/scriptorium-<version>-win-x64/
+//     Scriptorium.exe          the tray app (start recordings, see what runs)
 //     scriptorium.cmd          entry point (uses the bundled Node runtime)
 //     runtime/node.exe      the Node.js that runs this script (signed by the OpenJS Foundation)
 //     app/                  JS sources + sherpa-onnx (ONNX Runtime) modules
 //     native/               scriptorium-core.exe + whisper.cpp/ggml DLLs
 //     models/               Whisper, Silero VAD, pyannote segmentation, 3D-Speaker embedding
 //     LICENSES/             third-party notices and license texts
-// Usage: node scripts/package.js [--build cpu|vulkan] [--no-zip]
+// Also dist/scriptorium-<version>.mcpb (Claude Desktop Extension) and, with --installer,
+// dist/scriptorium-<version>-setup.exe (Inno Setup 6, installer/scriptorium.iss).
+// Usage: node scripts/package.js [--build cpu|vulkan] [--no-zip] [--installer]
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -23,6 +26,7 @@ const opt = (name, def) => {
 };
 const build = opt('--build', 'cpu');
 const zip = !args.includes('--no-zip');
+const installer = args.includes('--installer');
 
 const name = `scriptorium-${pkg.version}-win-x64${build === 'vulkan' ? '-gpu' : ''}`;
 const OUT = path.join(ROOT, 'dist', name);
@@ -63,6 +67,9 @@ for (const mod of ['sherpa-onnx-node', 'sherpa-onnx-win-x64']) {
 
 // runtime
 copy(process.execPath, path.join(OUT, 'runtime', 'node.exe'));
+
+// tray app (scripts\build-app.cmd); it links the C runtime statically, so it needs no DLLs
+copy(need(path.join(ROOT, 'build', 'app', 'Scriptorium.exe')), path.join(OUT, 'Scriptorium.exe'));
 
 // native: the helper and the libraries it loads, not whisper.cpp's sample programs
 need(path.join(nativeSrc, 'scriptorium-core.exe'));
@@ -153,4 +160,27 @@ if (zip) {
   const m = spawnSync(tar, ['--format', 'zip', '-c', '-f', mcpbPath, '-C', OUT, ...fs.readdirSync(OUT)], { stdio: 'inherit' });
   if (m.status !== 0) process.exit(m.status ?? 1);
   console.log(`mcpb: ${mcpbPath} (${(fs.statSync(mcpbPath).size / 1e6).toFixed(0)} MB)`);
+}
+
+if (installer) {
+  // Inno Setup's compiler: ISCC on the environment, else the per-user and machine-wide defaults
+  const local = process.env.LOCALAPPDATA || '';
+  const iscc = [
+    process.env.ISCC,
+    path.join(local, 'Programs', 'Inno Setup 6', 'ISCC.exe'),
+    'C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe',
+    'C:\\Program Files\\Inno Setup 6\\ISCC.exe',
+  ].find(f => f && fs.existsSync(f));
+  if (!iscc) {
+    console.error('Inno Setup 6 not found (set ISCC to ISCC.exe); the installer was not built');
+    process.exit(1);
+  }
+  const r = spawnSync(
+    iscc,
+    ['/Qp', `/DAppVersion=${pkg.version}`, `/DSourceDir=${OUT}`, `/DOutputDir=${path.join(ROOT, 'dist')}`, path.join(ROOT, 'installer', 'scriptorium.iss')],
+    { stdio: 'inherit' },
+  );
+  if (r.status !== 0) process.exit(r.status ?? 1);
+  const setup = path.join(ROOT, 'dist', `scriptorium-${pkg.version}-setup.exe`);
+  console.log(`installer: ${setup} (${(fs.statSync(setup).size / 1e6).toFixed(0)} MB)`);
 }

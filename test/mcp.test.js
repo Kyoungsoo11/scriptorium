@@ -31,7 +31,13 @@ test('setup-claude adds the server, keeps others, backs up, and is idempotent', 
   assert.equal(setupClaude(env, { configPath: config, dryRun: true, remove: true }).dryRun, true);
   assert.ok(JSON.parse(fs.readFileSync(config, 'utf8')).mcpServers.scriptorium, 'dry run must not write');
 
-  assert.equal(setupClaude(env, { configPath: config, remove: true }).action, 'removed');
+  // the uninstaller's --if-own leaves an entry that another copy registered
+  const own = JSON.parse(fs.readFileSync(config, 'utf8'));
+  const other = { ...own, mcpServers: { ...own.mcpServers, scriptorium: { command: 'x', args: ['D:\\other\\app\\bin\\scriptorium.js', 'mcp'] } } };
+  fs.writeFileSync(config, JSON.stringify(other));
+  assert.equal(setupClaude(env, { configPath: config, remove: true, ifOwn: true }).action, 'kept');
+  fs.writeFileSync(config, JSON.stringify(own));
+  assert.equal(setupClaude(env, { configPath: config, remove: true, ifOwn: true }).action, 'removed');
   assert.deepEqual(JSON.parse(fs.readFileSync(config, 'utf8')).mcpServers, original.mcpServers);
   assert.equal(setupClaude(env, { configPath: config, remove: true }).action, 'absent');
   fs.rmSync(dir, { recursive: true, force: true });

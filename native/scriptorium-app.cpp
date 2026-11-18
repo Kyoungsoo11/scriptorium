@@ -8,6 +8,9 @@
 //                                          A second launch brings the running app forward.
 //   Scriptorium.exe --background [...]     tray icon only; exits by itself once nothing is running.
 //                                          Does nothing if the app is already running.
+//   Scriptorium.exe --tray [...]           tray icon only, but stays until "종료" (Windows start-up)
+//   Scriptorium.exe --quit                 closes every running copy of this exe (installer, uninstaller);
+//                                          recordings are separate processes and are not touched
 //   Scriptorium.exe --probe <file> [...]   write a JSON self-check to <file> after 3 s and exit
 //                                          (runs next to a real instance; for scripts and tests)
 
@@ -17,6 +20,7 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <shobjidl.h>
 
 #include <algorithm>
 #include <cmath>
@@ -39,12 +43,14 @@ constexpr wchar_t kMutexPrefix[] = L"Local\\Scriptorium.App.";
 constexpr wchar_t kClassPrefix[] = L"Scriptorium.App.";
 constexpr wchar_t kProbeClass[] = L"Scriptorium.App.Probe";
 constexpr wchar_t kShowMessageName[] = L"Scriptorium.App.Show";
+constexpr wchar_t kQuitMessageName[] = L"Scriptorium.App.Quit";
 constexpr UINT kTrayId = 1;
 constexpr UINT WM_TRAY = WM_APP + 1;
 
 enum MenuId : UINT {
     ID_SHOW = 100,
     ID_OPEN_DATA,
+    ID_AUTOSTART,
     ID_STOP_ALL,
     ID_EXIT,
     ID_STOP_FIRST = 1000,  // + index into the menu's snapshot of recordings
@@ -218,6 +224,7 @@ struct App {
     std::wstring probeFile;
     UINT taskbarCreated = 0;
     UINT showMessage = 0;
+    UINT quitMessage = 0;
     bool trayAdded = false;
     TrayState trayState = TrayState::Idle;
     std::wstring tip = L"Scriptorium";
@@ -236,6 +243,7 @@ struct App {
     std::wstring rowsShape = L"\x1";  // keys + stop-button visibility the rows were built for (none yet)
     HWND runningHeader = nullptr, emptyLabel = nullptr;
     HWND lastFocus = nullptr;  // focused control when the window was last deactivated
+    std::wstring dataDirArg;   // --data-dir as given (empty: the default folder)
     bool modal = false;        // a message box is open
 } g;
 
@@ -1167,6 +1175,38 @@ void requestExit() {
     poll();
 }
 
+// ---- start with Windows -----------------------------------------------------------------------
+
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kRunValue[] = L"Scriptorium";
+
+/** True when HKCU\...\Run starts this exe (the installer's task and the menu write the same value). */
+bool autostartEnabled() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD size = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS)
+        return false;
+    std::wstring value = buf, exe = exePath();
+    CharLowerBuffW(value.data(), (DWORD)value.size());
+    CharLowerBuffW(exe.data(), (DWORD)exe.size());
+    return value.find(exe) != std::wstring::npos;  // another copy of Scriptorium does not count
+}
+
+void setAutostart(bool on) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        std::wstring cmd = quoteArg(exePath()) + L" --tray";
+        if (!g.dataDirArg.empty()) cmd += L" --data-dir " + quoteArg(g.paths.dataDir);
+        RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE *>(cmd.c_str()),
+                       (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, kRunValue);
+    }
+    RegCloseKey(key);
+}
+
 // ---- menu -----------------------------------------------------------------------------------
 
 void showMenu(POINT pt) {
@@ -1186,6 +1226,7 @@ void showMenu(POINT pt) {
     if (g.menuStopKeys.size() > 1) AppendMenuW(menu, MF_STRING, ID_STOP_ALL, L"녹음 모두 정지");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_OPEN_DATA, L"데이터 폴더 열기");
+    AppendMenuW(menu, MF_STRING | (autostartEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_AUTOSTART, L"Windows 시작 시 실행");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
     SetMenuDefaultItem(menu, ID_SHOW, FALSE);
@@ -1222,6 +1263,7 @@ void onCommand(UINT id, UINT code) {
         break;
     case ID_SHOW: showWindow(); break;
     case ID_OPEN_DATA: openDataFolder(); break;
+    case ID_AUTOSTART: setAutostart(!autostartEnabled()); break;
     case ID_STOP_ALL:
         stopAllRecordings();
         poll();
@@ -1284,6 +1326,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g.trayAdded = false;  // Explorer restarted: the icon is gone until we add it again
         g.trayIconDpi = 0;
         addTrayIcon();
+        return 0;
+    }
+    if (g.quitMessage && msg == g.quitMessage) {
+        DestroyWindow(hwnd);
         return 0;
     }
     if (g.showMessage && msg == g.showMessage) {
@@ -1380,11 +1426,53 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/**
+ * --quit: asks every app window whose process runs this same exe file to close (any data folder),
+ * and waits up to 10 s for those processes to end. Exit code 0 when none is left.
+ */
+int quitRunningCopies() {
+    UINT quit = RegisterWindowMessageW(kQuitMessageName);
+    std::wstring self = exePath();
+    struct Ctx {
+        UINT quit;
+        std::wstring self;
+        std::vector<HANDLE> procs;
+    } ctx{quit, self, {}};
+    EnumWindows(
+        [](HWND w, LPARAM lp) -> BOOL {
+            auto *c = reinterpret_cast<Ctx *>(lp);
+            wchar_t cls[64];
+            if (!GetClassNameW(w, cls, 64) || wcsncmp(cls, kClassPrefix, wcslen(kClassPrefix)) != 0) return TRUE;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w, &pid);
+            if (pid == GetCurrentProcessId()) return TRUE;
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+            if (!h) return TRUE;
+            wchar_t image[MAX_PATH * 4];
+            DWORD n = (DWORD)std::size(image);
+            // the image path keeps the form the process was started with (maybe 8.3 short)
+            if (QueryFullProcessImageNameW(h, 0, image, &n) && _wcsicmp(longPath(image).c_str(), c->self.c_str()) == 0) {
+                PostMessageW(w, c->quit, 0, 0);
+                c->procs.push_back(h);
+            } else {
+                CloseHandle(h);
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+    bool allGone = true;
+    for (HANDLE h : ctx.procs) {
+        allGone &= WaitForSingleObject(h, 10000) == WAIT_OBJECT_0;
+        CloseHandle(h);
+    }
+    return allGone ? 0 : 1;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g.inst = inst;
-    bool background = false;
+    bool background = false, trayOnly = false;
     std::wstring dataDirArg;
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -1393,13 +1481,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (a == L"--probe" && i + 1 < argc) g.probeFile = argv[++i];
         else if (a == L"--data-dir" && i + 1 < argc) dataDirArg = argv[++i];
         else if (a == L"--background") background = true;
+        else if (a == L"--tray") trayOnly = true;
+        else if (a == L"--quit") {
+            LocalFree(argv);
+            return quitRunningCopies();
+        }
     }
     LocalFree(argv);
     g.probe = !g.probeFile.empty();
     g.resident = !background && !g.probe;
+    g.dataDirArg = dataDirArg;
+    // Groups the app's notifications and a pinned shortcut under one identity (the installer's
+    // shortcuts carry the same AppUserModelID).
+    SetCurrentProcessExplicitAppUserModelID(L"Scriptorium.App");
     g.paths = resolvePaths(dataDirArg);
 
     g.showMessage = RegisterWindowMessageW(kShowMessageName);
+    g.quitMessage = RegisterWindowMessageW(kQuitMessageName);
     const std::wstring windowClass = kClassPrefix + instanceSuffix(g.paths.dataDir);
     // A probe runs alongside a real instance, so it skips the single-instance check.
     HANDLE mutex = nullptr;
@@ -1444,6 +1542,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // Lets Explorer's TaskbarCreated broadcast through UIPI if we ever run elevated.
     ChangeWindowMessageFilterEx(g.wnd, g.taskbarCreated, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g.wnd, g.showMessage, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g.wnd, g.quitMessage, MSGFLT_ALLOW, nullptr);
 
     addTrayIcon();
     if (!g.probe) writeAppFile();
@@ -1453,7 +1552,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!g.probe) requestLists();
     SetTimer(g.wnd, TIMER_POLL, 1000, nullptr);
     if (g.probe) SetTimer(g.wnd, TIMER_PROBE, 3000, nullptr);
-    else if (g.resident) showWindow();
+    else if (g.resident && !trayOnly) showWindow();
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {

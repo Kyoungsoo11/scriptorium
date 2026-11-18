@@ -1,7 +1,7 @@
 # Scriptorium
 
-**인터넷 없이 내 PC에서만 돌아가는 강의·회의 전사 도구 (Windows, CLI).**
-Offline lecture/meeting transcription for Windows — a non-interactive CLI, no server, no account.
+**인터넷 없이 내 PC에서만 돌아가는 강의·회의 전사 도구 (Windows, 트레이 앱 + CLI).**
+Offline lecture/meeting transcription for Windows — a small tray app and a non-interactive CLI, no server, no account.
 
 - 오디오·비디오 파일 전사, 마이크 + 컴퓨터 소리(시스템 오디오) 실시간 녹음 전사
 - 화자 분리 (누가 말했는지 `SPEAKER_00`, `SPEAKER_01` …), 화자 이름 붙이기
@@ -9,6 +9,7 @@ Offline lecture/meeting transcription for Windows — a non-interactive CLI, no 
 - **모든 명령이 옵션만으로 끝까지 실행**된다. 묻는 화면이 없어서 스크립트·자동화·AI 에이전트가 호출하기 좋다
 - 결과는 stdout에 JSON, 진행 상황은 stderr. 종료 코드 0/1/2
 - **Claude Desktop 채팅에서 말로 시킬 수 있다** (MCP 서버 내장): "이 강의 파일 전사해 줘", "지금부터 회의 녹음해 줘"
+- **트레이 앱**: 시작 메뉴에서 열어 설정을 고르고 녹음 시작, 진행 중인 녹음·전사를 알림 영역에서 확인하고 정지. 여러 녹음을 동시에 할 수 있다
 - 실행 중 네트워크 통신 없음. 녹음과 노트는 내 PC에만 저장
 
 > Scriptorium은 강의 노트 앱 [Alt](https://altalt.io)의 전사 기능이 어떻게 동작하는지 분석해, 공개된 오픈소스 부품으로 처음부터 다시 만든 도구입니다. Alt의 코드·바이너리·모델은 전혀 포함하지 않으며, Alt 개발사와 관계가 없습니다.
@@ -19,25 +20,38 @@ Offline lecture/meeting transcription for Windows — a non-interactive CLI, no 
 
 1. [빠른 시작](#빠른-시작)
 2. [요구 사항](#요구-사항)
-3. [명령어](#명령어)
-4. [옵션](#옵션)
-5. [출력](#출력)
-6. [실시간 녹음 다루기](#실시간-녹음-다루기)
-7. [Claude에서 쓰기 (MCP)](#claude에서-쓰기-mcp)
-8. [다른 프로그램에서 호출하기](#다른-프로그램에서-호출하기)
-9. [데이터 위치와 설정](#데이터-위치와-설정)
-10. [성능과 품질](#성능과-품질)
-11. [문제 해결](#문제-해결)
-12. [동작 원리](#동작-원리)
-13. [소스에서 빌드](#소스에서-빌드)
-14. [라이선스](#라이선스)
-15. [알려진 한계](#알려진-한계)
+3. [트레이 앱](#트레이-앱)
+4. [명령어](#명령어)
+5. [옵션](#옵션)
+6. [출력](#출력)
+7. [실시간 녹음 다루기](#실시간-녹음-다루기)
+8. [Claude에서 쓰기 (MCP)](#claude에서-쓰기-mcp)
+9. [다른 프로그램에서 호출하기](#다른-프로그램에서-호출하기)
+10. [데이터 위치와 설정](#데이터-위치와-설정)
+11. [성능과 품질](#성능과-품질)
+12. [문제 해결](#문제-해결)
+13. [동작 원리](#동작-원리)
+14. [소스에서 빌드](#소스에서-빌드)
+15. [라이선스](#라이선스)
+16. [알려진 한계](#알려진-한계)
 
 ---
 
 ## 빠른 시작
 
-> Claude Desktop 채팅에서 쓰려면 `scriptorium-<버전>.mcpb`를 받아 더블클릭하면 된다 → [Claude에서 쓰기](#claude에서-쓰기-mcp)
+### 설치 프로그램 (권장)
+
+1. [Releases](../../releases)에서 `scriptorium-<버전>-setup.exe`(약 600 MB)를 받아 실행한다. 관리자 권한은 필요 없다.
+2. 설치할 때 고를 수 있는 것: 바탕화면 바로가기, Windows 시작 시 트레이에서 실행, **Claude Desktop에 연결**(채팅에서 녹음·전사 요청).
+3. 시작 메뉴의 **Scriptorium**을 연다 → [트레이 앱](#트레이-앱)
+
+- 기본 설치 위치는 `%USERPROFILE%\Scriptorium`이다. 명령줄 도구도 그 안에 있다 (`scriptorium.cmd`).
+- 새 버전은 그냥 설치하면 덮어쓴다. 녹음이나 전사가 진행 중이면 설치 프로그램이 멈추고 알려 준다. Claude Desktop에 연결해 두었다면 업그레이드 뒤 Claude Desktop을 다시 열어야 한다.
+- 제거는 설정 → 앱 → 설치된 앱 → Scriptorium. 노트와 녹음(`%USERPROFILE%\.scriptorium`)은 지우지 않는다.
+
+### zip (설치 없이)
+
+> Claude Desktop 채팅에서만 쓰려면 `scriptorium-<버전>.mcpb`를 받아 더블클릭해도 된다 → [Claude에서 쓰기](#claude에서-쓰기-mcp)
 
 1. [Releases](../../releases)에서 `scriptorium-<버전>-win-x64.zip`(약 630 MB)을 받는다.
 2. 아무 폴더에 압축을 푼다. 예: `C:\Tools\scriptorium`
@@ -55,7 +69,9 @@ scriptorium.cmd transcribe "D:\강의\3주차.mp4" --lang ko --out 3주차.srt
 
 어디서나 `scriptorium`으로 부르고 싶으면 압축 푼 폴더를 PATH에 추가한다 (설정 → 시스템 → 정보 → 고급 시스템 설정 → 환경 변수 → Path). 아래 예시는 PATH에 추가했다고 가정하고 `scriptorium`으로 적는다.
 
-> 처음 실행할 때 Windows SmartScreen이 "알 수 없는 게시자" 경고를 띄울 수 있다. 직접 빌드한 `scriptorium-core.exe`에 코드 서명이 없기 때문이다. "추가 정보 → 실행"으로 넘어가면 된다.
+트레이 앱은 압축 푼 폴더의 `Scriptorium.exe`다 (또는 `scriptorium app`).
+
+> 처음 실행할 때 Windows SmartScreen이 "알 수 없는 게시자" 경고를 띄울 수 있다. 설치 프로그램, `Scriptorium.exe`, `scriptorium-core.exe`에 코드 서명이 없기 때문이다. "추가 정보 → 실행"으로 넘어가면 된다.
 
 ## 요구 사항
 
@@ -65,6 +81,30 @@ scriptorium.cmd transcribe "D:\강의\3주차.mp4" --lang ko --out 3주차.srt
 - 따로 설치할 것 없음: Node.js 런타임, Visual C++ 런타임, 모델이 모두 들어 있다
 
 ---
+
+## 트레이 앱
+
+`Scriptorium.exe`는 알림 영역(작업 표시줄 오른쪽, 시계 옆)에 아이콘으로 사는 작은 앱이다. 녹음과 전사는 명령줄 도구가 하고, 앱은 그것을 시작·표시·정지한다. 그래서 명령줄이나 Claude에서 시작한 녹음도 앱에 보이고, 앱을 닫아도 녹음은 끊기지 않는다.
+
+**열기**: 시작 메뉴의 Scriptorium, 바탕화면 바로가기, 또는 `scriptorium app`. 이미 실행 중이면 그 창을 앞으로 가져온다. 창은 작업 표시줄에 뜨지 않고, 닫기(X)를 누르면 숨기만 한다. 트레이 아이콘을 누르면 다시 열린다.
+
+> Windows 11은 새 트레이 아이콘을 숨김 영역(^) 안에 넣는다. 늘 보이게 하려면 아이콘을 작업 표시줄로 끌어다 놓는다.
+
+**창**
+
+- **진행 중**: 녹음(경과 시간, 마이크 음소거·무신호 경고는 빨간색)과 파일 전사(진행률, 여러 파일이면 몇 번째인지). 녹음마다 **정지** 버튼
+- **새 녹음**: 제목(비우면 날짜와 시간), 폴더(목록에서 고르거나 새 이름), 소리(마이크 + 컴퓨터 소리 / 컴퓨터 소리만 / 마이크만), 마이크, 언어. **고급 설정**: 화자 수, 시간 제한(`50m`, `1h30m`), 단어 힌트. **녹음 시작**(또는 Enter). 녹음이 진행 중이어도 더 시작할 수 있다
+- 마지막으로 고른 소리·마이크·언어·폴더는 기억한다
+
+**트레이 아이콘**: 평소 모양 / 빨간 점 = 녹음 중 / 파란 점 = 전사 중(파일 전사, 녹음 마무리). 마우스를 올리면 개수가 보인다. 오른쪽 클릭 메뉴: 열기, 녹음별 정지, 녹음 모두 정지, 데이터 폴더 열기, Windows 시작 시 실행, 종료.
+
+**알림**: 녹음·전사가 끝나거나 실패하면, 그리고 녹음 중 마이크에서 소리가 안 들어오면 Windows 알림을 띄운다 (방해 금지 중에는 안 뜬다).
+
+**언제 떠 있나**
+
+- 시작 메뉴 등으로 연 앱은 메뉴의 **종료**까지 떠 있다. 녹음·전사가 진행 중일 때 종료하면, 녹음을 정지하고 전사가 다 끝난 뒤 닫힌다. 그때까지 아이콘은 남는다.
+- 명령줄이나 Claude에서 녹음·전사를 시작하면 앱이 아이콘만으로 자동 실행되고, 작업이 끝나고 15초 뒤 스스로 닫힌다. 그 사이 앱이 꺼지면 5초 안에 다시 뜬다. 끄려면 환경 변수 `SCRIPTORIUM_NO_GUI=1`.
+- **Windows 시작 시 실행**을 켜면 로그인할 때 아이콘만으로 시작한다.
 
 ## 명령어
 
@@ -81,6 +121,7 @@ scriptorium <명령> [옵션]
 | `notes …` | 노트 목록·보기·내보내기·이름 변경·이동·삭제 |
 | `folders …` | 폴더 목록·만들기·삭제 |
 | `speakers rename …` | 화자 이름 붙이기 |
+| `app` | 트레이 앱 열기 |
 | `devices` | 오디오 장치 목록 |
 | `doctor` | 엔진·모델·오디오 장치 점검 |
 | `help`, `version` | 도움말, 버전 |
@@ -332,9 +373,9 @@ Scriptorium에는 MCP 서버가 들어 있어서, Claude Desktop 채팅에서 �
 2. 파일을 더블클릭하거나, Claude Desktop의 설정 → 확장 프로그램(Extensions) 화면에 끌어다 놓고 설치한다.
 3. 채팅 입력창의 도구 목록에 Scriptorium이 보이면 끝.
 
-### 방법 2: zip 설치본을 Claude에 연결
+### 방법 2: 설치본을 Claude에 연결
 
-zip을 풀어 둔 상태라면 명령 하나로 Claude Desktop 설정에 등록할 수 있다.
+설치 프로그램에서 **Claude Desktop에 연결**을 골랐다면 이미 등록돼 있다 (Claude Desktop을 다시 열면 적용). zip을 풀어 두었거나 나중에 연결하려면 명령 하나로 Claude Desktop 설정에 등록할 수 있다.
 
 ```bash
 scriptorium setup-claude
@@ -343,7 +384,7 @@ scriptorium setup-claude
 - Claude Desktop 설정 파일(`claude_desktop_config.json`)을 찾아 `scriptorium` 서버를 추가한다. 일반 설치판과 Microsoft Store 설치판 위치를 모두 찾고, 다른 MCP 서버와 설정은 그대로 둔다.
 - 바꾸기 전 파일을 `claude_desktop_config.json.bak-<시각>`으로 백업한다.
 - **Claude Desktop을 완전히 종료했다가 다시 열어야** 적용된다 (작업 표시줄 트레이 아이콘에서 종료).
-- `--dry-run`: 무엇을 바꿀지만 보여 줌, `--remove`: 등록 해제, `--config <파일>`: 설정 파일 직접 지정
+- `--dry-run`: 무엇을 바꿀지만 보여 줌, `--remove`: 등록 해제(`--if-own`을 붙이면 이 설치본이 등록한 것만, 제거 프로그램이 쓴다), `--config <파일>`: 설정 파일 직접 지정
 
 직접 편집하려면 `mcpServers`에 이렇게 넣는다 (경로는 압축 푼 위치에 맞게):
 
@@ -437,7 +478,8 @@ scriptorium notes export <noteId> --out 회의.md
 |---|---|
 | 노트 DB (SQLite) | `%USERPROFILE%\.scriptorium\scriptorium.db` |
 | 녹음 WAV | `%USERPROFILE%\.scriptorium\recordings\<noteId>.wav` |
-| 실행 중 녹음 상태·로그 | `%USERPROFILE%\.scriptorium\run\` |
+| 실행 중 녹음·전사 상태, 로그, 끝난 작업 알림 | `%USERPROFILE%\.scriptorium\run\` (`recording-*.json`, `transcribe-*.json`, `finished-*.json`, `app.json`) |
+| 트레이 앱 설정 (마지막 선택) | `%USERPROFILE%\.scriptorium\gui.json` |
 | 모델 | 프로그램 폴더 `models\` |
 
 0.2.0은 데이터를 `%APPDATA%\scriptorium`에 두었다. 0.3.0부터는 `%USERPROFILE%\.scriptorium`을 쓴다. Microsoft Store판 Claude Desktop이 실행한 프로그램은 AppData에 쓰는 내용이 Claude 전용 위치로 옮겨져서, 명령줄과 Claude의 노트가 갈라지기 때문이다. 0.2.0에서 만든 노트를 계속 쓰려면 폴더 내용을 옮기면 된다.
@@ -450,6 +492,8 @@ scriptorium notes export <noteId> --out 회의.md
 | `SCRIPTORIUM_MODELS` | 모델 폴더 |
 | `SCRIPTORIUM_NATIVE` | `scriptorium-core.exe`가 있는 폴더 |
 | `SCRIPTORIUM_VAD_THRESHOLD` | 말소리 감지 민감도 기본값 |
+| `SCRIPTORIUM_NO_GUI` | `1`이면 녹음·전사 중 트레이 앱을 띄우지 않음 |
+| `SCRIPTORIUM_APP` | 트레이 앱 `Scriptorium.exe` 경로 |
 
 노트 DB는 일반 SQLite 파일이다. 표: `lecture_notes`(노트), `folders`, `note_components`(전사·녹음 파일). 전사는 `component_type = 'transcript'`인 행의 `content_text`에 JSON(`[{speaker, segments:[{start,end,text,speaker}]}]`, ms)으로, 화자 이름은 `metadata.speakerNames`에 들어 있다.
 
@@ -489,6 +533,8 @@ scriptorium notes export <noteId> --out 회의.md
 | 마이크가 녹음 안 된다 | Windows 설정 → 개인 정보 → 마이크에서 데스크톱 앱 접근 허용 |
 | 느리다 | `--beam 1`, `--no-diarize`, 또는 더 작은 Whisper 모델(`--whisper-model`) |
 | Claude 채팅에 Scriptorium 도구가 안 보인다 | Claude Desktop을 트레이에서 완전히 종료 후 다시 열기. `scriptorium setup-claude --dry-run`으로 어느 설정 파일에 등록되는지 확인 |
+| 트레이 아이콘이 안 보인다 | 작업 표시줄의 ^ (숨겨진 아이콘)를 열어 본다. 데이터 폴더마다 앱이 따로 뜬다 (`--data-dir`, `SCRIPTORIUM_HOME`) |
+| 설치 프로그램이 "녹음 또는 전사 중"이라며 멈춘다 | 트레이 앱에서 녹음을 정지하고 전사가 끝난 뒤 다시 실행 |
 | Claude가 만든 노트가 명령줄에서 안 보인다 | 둘 다 0.3.0 이상인지 확인 (`scriptorium version`). 데이터 폴더를 따로 지정했다면 `SCRIPTORIUM_HOME`을 맞출 것 |
 | 실행하자마자 DLL 오류 | 압축을 푼 폴더 구조를 바꾸지 말 것 (`native\`, `app\`, `runtime\`, `models\`가 같은 곳에 있어야 함) |
 
@@ -543,6 +589,11 @@ scripts\build-whisper.cmd cpu
 ```bash
 scripts\build-core.cmd cpu
 ```
+```bash
+scripts\build-app.cmd
+```
+
+`build-app.cmd`는 트레이 앱(`build\app\Scriptorium.exe`)을 만든다. Build Tools만 있으면 된다.
 
 모델 4개를 `models\`에 둔다:
 
@@ -566,7 +617,15 @@ node bin/scriptorium.js doctor
 node scripts/package.js
 ```
 
-→ `dist\scriptorium-<버전>-win-x64\`, `dist\scriptorium-<버전>-win-x64.zip`
+→ `dist\scriptorium-<버전>-win-x64\`, `dist\scriptorium-<버전>-win-x64.zip`, `dist\scriptorium-<버전>.mcpb`
+
+설치 프로그램까지 만들려면 [Inno Setup 6](https://jrsoftware.org/isinfo.php)을 설치하고 (`winget install JRSoftware.InnoSetup`):
+
+```bash
+node scripts/package.js --installer
+```
+
+→ `dist\scriptorium-<버전>-setup.exe` (스크립트: `installer\scriptorium.iss`)
 
 GPU(Vulkan) 빌드는 [Vulkan SDK](https://vulkan.lunarg.com/)를 설치한 뒤 `scripts\build-whisper.cmd vulkan` → `scripts\build-core.cmd vulkan` → `node scripts/package.js --build vulkan` (아직 검증하지 않았다).
 
@@ -588,4 +647,5 @@ Scriptorium 자체 코드는 [MIT 라이선스](LICENSE)다.
 - **실시간 녹음**: 묶음이 짧아 같은 소리를 파일로 전사할 때보다 약간 부정확할 수 있다. 화자 라벨은 녹음이 끝난 뒤에 붙는다.
 - **MP3**: 앞부분 인코더 지연(약 50 ms)만큼 시간이 늦게 찍힌다.
 - 메모리: 화자 분리를 위해 전체 오디오를 메모리에 둔다 (1시간에 약 230 MB).
+- **동시 녹음**: 녹음마다 음성 인식 모델을 따로 띄운다 (하나에 약 725 MB). 3개를 함께 돌리면 실시간 자막이 많이 밀리고 정지 후 마무리가 몇 분 걸린다 (16코어 노트북에서 측정). 최종 노트는 온전하다.
 - 검증 안 함: Windows 10, 다른 PC(AVX2 없는 CPU 등), 3시간 이상 녹음.

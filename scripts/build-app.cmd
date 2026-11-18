@@ -10,5 +10,5 @@ if not exist "%OUT%" mkdir "%OUT%"
 rc /nologo /fo "%OUT%\scriptorium-app.res" "%ROOT%\native\scriptorium-app.rc" || exit /b 1
 cl /nologo /EHsc /O2 /std:c++17 /utf-8 /W4 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
   "%ROOT%\native\scriptorium-app.cpp" /Fo"%OUT%\scriptorium-app.obj" /Fe"%OUT%\Scriptorium.exe" ^
-  /link /SUBSYSTEM:WINDOWS "%OUT%\scriptorium-app.res" user32.lib shell32.lib comctl32.lib gdi32.lib || exit /b 1
+  /link /SUBSYSTEM:WINDOWS "%OUT%\scriptorium-app.res" user32.lib shell32.lib comctl32.lib gdi32.lib advapi32.lib || exit /b 1
 echo BUILD OK

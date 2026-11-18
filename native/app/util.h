@@ -64,10 +64,21 @@ inline std::wstring envVar(const wchar_t *name) {
     return n && n < std::size(buf) ? std::wstring(buf, n) : std::wstring();
 }
 
+/**
+ * This exe's full path in its long form: started through a short (8.3) path such as
+ * C:\Users\KYOUNG~1\..., GetModuleFileName reports that form, while the installer and
+ * QueryFullProcessImageName use the long one, and comparisons between them must match.
+ */
+inline std::wstring longPath(const std::wstring &p) {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD m = GetLongPathNameW(p.c_str(), buf, (DWORD)std::size(buf));
+    return m && m < std::size(buf) ? std::wstring(buf, m) : p;
+}
+
 inline std::wstring exePath() {
     wchar_t buf[MAX_PATH * 4];
     DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)std::size(buf));
-    return std::wstring(buf, n);
+    return longPath(std::wstring(buf, n));
 }
 
 /** Whole file as bytes; empty with ok=false when it cannot be read. */

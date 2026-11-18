@@ -50,7 +50,7 @@ App
 Setup
   devices                          audio devices
   doctor                           check that the engine and models are in place
-  setup-claude [--remove] [--dry-run] [--config <file>]
+  setup-claude [--remove [--if-own]] [--dry-run] [--config <file>]
                                    register Scriptorium with Claude Desktop (then restart Claude)
   mcp                              run as an MCP server on stdin/stdout (Claude Desktop starts this)
 
@@ -753,7 +753,7 @@ const COMMANDS = {
   app: {},
   devices: {},
   doctor: {},
-  'setup-claude': { values: ['config'], booleans: ['remove', 'dry-run'] },
+  'setup-claude': { values: ['config'], booleans: ['remove', 'if-own', 'dry-run'] },
   mcp: {},
 };
 
@@ -813,7 +813,14 @@ async function main(argv = process.argv.slice(2)) {
         cmdDoctor(env);
         break;
       case 'setup-claude':
-        printJson(require('./claude').setupClaude(env, { configPath: opts.config, remove: opts.remove, dryRun: opts['dry-run'] }));
+        printJson(
+          require('./claude').setupClaude(env, {
+            configPath: opts.config,
+            remove: opts.remove,
+            ifOwn: opts['if-own'],
+            dryRun: opts['dry-run'],
+          }),
+        );
         break;
       case 'mcp':
         await require('./mcp').serve(opts);
