@@ -89,3 +89,20 @@ test('Store keeps notes, folders, transcripts and search', () => {
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('app command reports a missing tray app instead of failing silently', () => {
+  const { spawnSync } = require('node:child_process');
+  const missing = path.join(os.tmpdir(), `scriptorium-no-app-${process.pid}.exe`);
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'scriptorium.js'), 'app'], {
+    env: { ...process.env, SCRIPTORIUM_APP: missing },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /tray app is missing/);
+  assert.match(r.stderr, /scripts\\build-app\.cmd/);
+});
+
+test('resolveEnv points at the tray app', () => {
+  const { resolveEnv } = require('../src/env');
+  assert.equal(path.basename(resolveEnv().appExe), 'Scriptorium.exe');
+});

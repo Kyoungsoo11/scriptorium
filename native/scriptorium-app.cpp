@@ -1,14 +1,15 @@
-// Scriptorium.exe - the tray app (A0 spike). Proves that an unsigned, locally built GUI exe runs
-// on this machine and can own a notification-area icon. Later units grow it into the real app
-// (recording list, settings window, CLI integration); the pieces here are the ones they keep:
+// Scriptorium.exe - the tray app. A small Win32 program that lives in the notification area while
+// Scriptorium is working: it shows what is recording or transcribing, starts new recordings and
+// stops running ones. It does no audio work itself; it runs the CLI (`scriptorium record --detach`)
+// and watches the state files the CLI keeps in <data>\run, so recordings started from the CLI or
+// from Claude (MCP) show up here too, and closing the app never stops a recording.
 //
-//   - one instance per user session (named mutex); a second launch tells the first to show itself
-//   - a tray icon that is re-added when Explorer restarts ("TaskbarCreated")
-//   - a small window that never gets a taskbar button; closing it hides it
-//
-//   Scriptorium.exe                 start (or bring the running instance forward)
-//   Scriptorium.exe --probe <file>  start, add the tray icon, write a JSON report to <file>, exit
-//                                   after 3 s (used by scripts to check the exe runs at all)
+//   Scriptorium.exe [--data-dir <dir>]     open the app: tray icon + window; stays until "종료".
+//                                          A second launch brings the running app forward.
+//   Scriptorium.exe --background [...]     tray icon only; exits by itself once nothing is running.
+//                                          Does nothing if the app is already running.
+//   Scriptorium.exe --probe <file> [...]   write a JSON self-check to <file> after 3 s and exit
+//                                          (runs next to a real instance; for scripts and tests)
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,111 +18,347 @@
 #include <windowsx.h>
 #include <commctrl.h>
 
-#include <cstdio>
+#include <algorithm>
+#include <cmath>
 #include <string>
+#include <vector>
+
+#include "app/json.h"
+#include "app/util.h"
+
+using namespace app;
 
 namespace {
 
 constexpr wchar_t kMutexName[] = L"Local\\Scriptorium.App";
 constexpr wchar_t kWindowClass[] = L"Scriptorium.App";
+constexpr wchar_t kProbeClass[] = L"Scriptorium.App.Probe";
 constexpr wchar_t kShowMessageName[] = L"Scriptorium.App.Show";
 constexpr UINT kTrayId = 1;
 constexpr UINT WM_TRAY = WM_APP + 1;
-constexpr UINT ID_SHOW = 100;
-constexpr UINT ID_EXIT = 101;
-constexpr UINT_PTR TIMER_PROBE = 1;
 
-HINSTANCE g_inst;
-HWND g_wnd;
-UINT g_taskbarCreated;
-UINT g_showMessage;
-bool g_trayAdded = false;
-std::wstring g_probeFile;
+enum MenuId : UINT { ID_SHOW = 100, ID_OPEN_DATA, ID_EXIT };
+enum TimerId : UINT_PTR { TIMER_PROBE = 1, TIMER_POLL };
+constexpr ULONGLONG kIdleExitMs = 15000;  // background mode: linger so the last notice can be read
 
-HICON loadAppIcon(int size) {
-    return static_cast<HICON>(LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+// ---- where things are ---------------------------------------------------------
+
+struct Paths {
+    std::wstring root;     // the Scriptorium folder (packaged) or the repository (development)
+    std::wstring node;     // node.exe that runs the CLI
+    std::wstring cli;      // bin\scriptorium.js
+    std::wstring dataDir;  // notes, recordings, run\ (same rule as src/env.js)
+    std::wstring runDir;
+    bool packaged = false;
+};
+
+std::wstring findOnPath(const wchar_t *exe) {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD n = SearchPathW(nullptr, exe, nullptr, (DWORD)std::size(buf), buf, nullptr);
+    return n && n < std::size(buf) ? std::wstring(buf, n) : std::wstring();
+}
+
+/**
+ * Packaged:     <root>\Scriptorium.exe, <root>\runtime\node.exe, <root>\app\bin\scriptorium.js
+ * Development:  <repo>\build\app\Scriptorium.exe, node on PATH, <repo>\bin\scriptorium.js
+ */
+Paths resolvePaths(const std::wstring &dataDirArg) {
+    Paths p;
+    std::wstring exeDir = parentDir(exePath());
+    if (fileExists(joinPath(exeDir, L"app\\bin\\scriptorium.js"))) {
+        p.packaged = true;
+        p.root = exeDir;
+        p.cli = joinPath(exeDir, L"app\\bin\\scriptorium.js");
+        p.node = joinPath(exeDir, L"runtime\\node.exe");
+    } else {
+        for (std::wstring d = exeDir; !d.empty(); d = parentDir(d)) {
+            if (fileExists(joinPath(d, L"bin\\scriptorium.js")) && fileExists(joinPath(d, L"package.json"))) {
+                p.root = d;
+                p.cli = joinPath(d, L"bin\\scriptorium.js");
+                break;
+            }
+        }
+        std::wstring bundled = joinPath(p.root, L"runtime\\node.exe");
+        p.node = fileExists(bundled) ? bundled : findOnPath(L"node.exe");
+    }
+    if (!dataDirArg.empty()) p.dataDir = fullPath(dataDirArg);
+    else if (std::wstring home = envVar(L"SCRIPTORIUM_HOME"); !home.empty()) p.dataDir = fullPath(home);
+    else p.dataDir = joinPath(envVar(L"USERPROFILE"), L".scriptorium");
+    p.runDir = joinPath(p.dataDir, L"run");
+    return p;
+}
+
+// ---- state ------------------------------------------------------------------------
+
+enum class TrayState { Idle, Recording, Working };
+
+struct App {
+    HINSTANCE inst = nullptr;
+    HWND wnd = nullptr;
+    Paths paths;
+    bool resident = false;  // opened by the user: stays until "종료"
+    bool probe = false;
+    std::wstring probeFile;
+    UINT taskbarCreated = 0;
+    UINT showMessage = 0;
+    bool trayAdded = false;
+    TrayState trayState = TrayState::Idle;
+    std::wstring tip = L"Scriptorium";
+    HICON trayIcons[3] = {};
+    UINT trayIconDpi = 0;
+    HFONT font = nullptr;
+    UINT fontDpi = 0;
+    ULONGLONG idleSince = 0;
+} g;
+
+UINT windowDpi() { return g.wnd ? GetDpiForWindow(g.wnd) : 96; }
+int scaled(int px, UINT dpi) { return MulDiv(px, (int)dpi, 96); }
+
+// ---- tray icon ------------------------------------------------------------------------
+
+/**
+ * The app icon at `size` px with a status dot in the lower right (none for idle). Drawn by hand
+ * into a 32-bit bitmap so the dot's edge is anti-aliased and the icon keeps its transparency.
+ */
+HICON makeStateIcon(int size, TrayState state) {
+    HICON base = static_cast<HICON>(LoadImageW(g.inst, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+    if (state == TrayState::Idle || !base) return base;
+
+    ICONINFO ii{};
+    if (!GetIconInfo(base, &ii)) return base;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    std::vector<uint32_t> px((size_t)size * size);
+    HDC dc = GetDC(nullptr);
+    bool ok = GetDIBits(dc, ii.hbmColor, 0, size, px.data(), &bi, DIB_RGB_COLORS) == size;
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    if (!ok) {
+        ReleaseDC(nullptr, dc);
+        return base;
+    }
+
+    // Recording: red. Working (transcribing, finishing a recording): blue.
+    const bool rec = state == TrayState::Recording;
+    const double fill[3] = {rec ? 229.0 : 37.0, rec ? 57.0 : 122.0, rec ? 53.0 : 245.0};  // r, g, b
+    const double r = size * 0.24, ring = std::max(1.0, size / 16.0);
+    const double cx = size - r - ring, cy = size - r - ring;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            double d = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+            double outer = std::clamp(r + ring - d + 0.5, 0.0, 1.0);  // dot + white ring coverage
+            if (outer <= 0) continue;
+            double inner = std::clamp(r - d + 0.5, 0.0, 1.0);  // dot coverage
+            uint32_t &p = px[(size_t)y * size + x];
+            double a0 = ((p >> 24) & 0xFF) / 255.0;
+            // straight (non-premultiplied) colour of the existing pixel
+            double b0 = a0 ? (p & 0xFF) / a0 : 0, g0 = a0 ? ((p >> 8) & 0xFF) / a0 : 0, r0 = a0 ? ((p >> 16) & 0xFF) / a0 : 0;
+            // the ring is white; the dot is drawn on top of it
+            double cr = 255 * (1 - inner) + fill[0] * inner, cg = 255 * (1 - inner) + fill[1] * inner,
+                   cb = 255 * (1 - inner) + fill[2] * inner;
+            double a = outer + a0 * (1 - outer);
+            auto mix = [&](double top, double bottom) { return a ? (top * outer + bottom * a0 * (1 - outer)) / a : 0; };
+            double nr = mix(cr, r0), ng = mix(cg, g0), nb = mix(cb, b0);
+            // GDI icons take premultiplied alpha
+            p = ((uint32_t)std::lround(a * 255) << 24) | ((uint32_t)std::lround(nr * a) << 16) |
+                ((uint32_t)std::lround(ng * a) << 8) | (uint32_t)std::lround(nb * a);
+        }
+    }
+
+    void *bits = nullptr;
+    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!color) return base;
+    memcpy(bits, px.data(), px.size() * 4);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    ICONINFO out{TRUE, 0, 0, mask, color};
+    HICON icon = CreateIconIndirect(&out);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if (!icon) return base;
+    DestroyIcon(base);
+    return icon;
+}
+
+void loadTrayIcons() {
+    UINT dpi = windowDpi();
+    if (dpi == g.trayIconDpi && g.trayIcons[0]) return;
+    for (HICON &i : g.trayIcons)
+        if (i) DestroyIcon(i), i = nullptr;
+    int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    g.trayIcons[0] = makeStateIcon(size, TrayState::Idle);
+    g.trayIcons[1] = makeStateIcon(size, TrayState::Recording);
+    g.trayIcons[2] = makeStateIcon(size, TrayState::Working);
+    g.trayIconDpi = dpi;
+}
+
+NOTIFYICONDATAW trayData(UINT flags) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof nid;
+    nid.hWnd = g.wnd;
+    nid.uID = kTrayId;
+    nid.uFlags = flags;
+    return nid;
+}
+
+void fillTrayLook(NOTIFYICONDATAW &nid) {
+    loadTrayIcons();
+    nid.uFlags |= NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.hIcon = g.trayIcons[(int)g.trayState];
+    wcsncpy_s(nid.szTip, g.tip.c_str(), _TRUNCATE);
 }
 
 bool addTrayIcon() {
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof nid;
-    nid.hWnd = g_wnd;
-    nid.uID = kTrayId;
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
+    NOTIFYICONDATAW nid = trayData(NIF_MESSAGE);
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = loadAppIcon(GetSystemMetrics(SM_CXSMICON));
-    wcscpy_s(nid.szTip, L"Scriptorium");
-    bool ok = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
-    if (ok) {
+    fillTrayLook(nid);
+    g.trayAdded = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    if (g.trayAdded) {
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
     }
-    g_trayAdded = ok;
-    return ok;
+    return g.trayAdded;
+}
+
+/** Updates the icon and tooltip; re-adds the icon if Explorer lost it. */
+void setTray(TrayState state, const std::wstring &tip) {
+    if (state == g.trayState && tip == g.tip && g.trayAdded) return;
+    g.trayState = state;
+    g.tip = tip;
+    NOTIFYICONDATAW nid = trayData(0);
+    fillTrayLook(nid);
+    if (!g.trayAdded || !Shell_NotifyIconW(NIM_MODIFY, &nid)) addTrayIcon();
 }
 
 void removeTrayIcon() {
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof nid;
-    nid.hWnd = g_wnd;
-    nid.uID = kTrayId;
+    NOTIFYICONDATAW nid = trayData(0);
     Shell_NotifyIconW(NIM_DELETE, &nid);
-    g_trayAdded = false;
+    g.trayAdded = false;
+}
+
+// ---- window -------------------------------------------------------------------------------
+
+HFONT uiFont() {
+    UINT dpi = windowDpi();
+    if (g.font && g.fontDpi == dpi) return g.font;
+    if (g.font) DeleteObject(g.font);
+    NONCLIENTMETRICSW ncm{sizeof ncm};
+    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0, dpi);
+    g.font = CreateFontIndirectW(&ncm.lfMessageFont);
+    g.fontDpi = dpi;
+    return g.font;
+}
+
+/** Puts the window in the lower right of the work area, next to the notification area. */
+void placeNearTray() {
+    RECT wr;
+    GetWindowRect(g.wnd, &wr);
+    MONITORINFO mi{sizeof mi};
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    GetMonitorInfoW(MonitorFromWindow(taskbar ? taskbar : g.wnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    int margin = scaled(12, windowDpi());
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    SetWindowPos(g.wnd, nullptr, mi.rcWork.right - w - margin, mi.rcWork.bottom - h - margin, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 void showWindow() {
     // Not SW_SHOWNORMAL: on a process's first ShowWindow call Windows replaces SW_SHOWNORMAL with
     // the launcher's STARTUPINFO show state, which started the window minimized in testing.
-    ShowWindow(g_wnd, SW_SHOW);
-    if (IsIconic(g_wnd)) ShowWindow(g_wnd, SW_RESTORE);
-    SetForegroundWindow(g_wnd);
+    if (!IsWindowVisible(g.wnd)) placeNearTray();
+    ShowWindow(g.wnd, SW_SHOW);
+    if (IsIconic(g.wnd)) ShowWindow(g.wnd, SW_RESTORE);
+    SetForegroundWindow(g.wnd);
 }
 
-/** Window size in device pixels for a size given at 96 DPI (100 % scaling). */
-int scaled(int px, UINT dpi) { return MulDiv(px, (int)dpi, 96); }
+void openDataFolder() {
+    makeDirs(g.paths.dataDir);
+    ShellExecuteW(g.wnd, L"open", g.paths.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// ---- running work -------------------------------------------------------------------
+
+/** True while anything is recording or transcribing (filled in by the activity monitor). */
+bool busy() { return false; }
+
+/** Background mode ends by itself a little while after the last piece of work. */
+void checkIdleExit() {
+    if (g.resident || g.probe) {
+        g.idleSince = 0;
+        return;
+    }
+    if (busy()) {
+        g.idleSince = 0;
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    if (!g.idleSince) g.idleSince = now;
+    else if (now - g.idleSince >= kIdleExitMs) DestroyWindow(g.wnd);
+}
+
+void requestExit() { DestroyWindow(g.wnd); }
+
+// ---- menu -----------------------------------------------------------------------------------
 
 void showMenu(POINT pt) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_SHOW, L"열기");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_OPEN_DATA, L"데이터 폴더 열기");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
     SetMenuDefaultItem(menu, ID_SHOW, FALSE);
-    SetForegroundWindow(g_wnd);  // otherwise the menu does not close when clicking elsewhere
-    TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, g_wnd, nullptr);
-    PostMessageW(g_wnd, WM_NULL, 0, 0);
+    SetForegroundWindow(g.wnd);  // otherwise the menu does not close when clicking elsewhere
+    UINT align = GetSystemMetrics(SM_MENUDROPALIGNMENT) ? TPM_RIGHTALIGN : TPM_LEFTALIGN;
+    TrackPopupMenuEx(menu, align | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, g.wnd, nullptr);
+    PostMessageW(g.wnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
 
-std::string utf8(const std::wstring &w) {
-    if (w.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
+void onCommand(UINT id) {
+    switch (id) {
+    case ID_SHOW: showWindow(); break;
+    case ID_OPEN_DATA: openDataFolder(); break;
+    case ID_EXIT: requestExit(); break;
+    }
 }
+
+// ---- probe ------------------------------------------------------------------------------------
 
 void writeProbe() {
-    FILE *f = _wfopen(g_probeFile.c_str(), L"wb");
-    if (!f) return;
-    wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::string path = utf8(exe);
-    std::string esc;
-    for (char c : path) {
-        if (c == '\\' || c == '"') esc += '\\';
-        esc += c;
-    }
-    fprintf(f, "{\"ok\":true,\"pid\":%lu,\"tray\":%s,\"dpi\":%u,\"exe\":\"%s\"}\n", GetCurrentProcessId(),
-            g_trayAdded ? "true" : "false", GetDpiForWindow(g_wnd), esc.c_str());
-    fclose(f);
+    const Paths &p = g.paths;
+    std::string json = "{\"ok\":true";
+    json += ",\"pid\":" + std::to_string(GetCurrentProcessId());
+    json += std::string(",\"tray\":") + (g.trayAdded ? "true" : "false");
+    json += ",\"dpi\":" + std::to_string(windowDpi());
+    json += ",\"exe\":" + jsonString(exePath());
+    json += std::string(",\"packaged\":") + (p.packaged ? "true" : "false");
+    json += ",\"root\":" + jsonString(p.root);
+    json += ",\"node\":" + jsonString(p.node);
+    json += std::string(",\"nodeFound\":") + (fileExists(p.node) ? "true" : "false");
+    json += ",\"cli\":" + jsonString(p.cli);
+    json += std::string(",\"cliFound\":") + (fileExists(p.cli) ? "true" : "false");
+    json += ",\"dataDir\":" + jsonString(p.dataDir);
+    json += "}\n";
+    writeFileAtomic(g.probeFile, json);
 }
 
+// ---- window procedure -------------------------------------------------------------------
+
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g_taskbarCreated && g_taskbarCreated) {
-        addTrayIcon();  // Explorer restarted: the icon is gone until we add it again
+    if (g.taskbarCreated && msg == g.taskbarCreated) {
+        g.trayAdded = false;  // Explorer restarted: the icon is gone until we add it again
+        g.trayIconDpi = 0;
+        addTrayIcon();
         return 0;
     }
-    if (msg == g_showMessage && g_showMessage) {
+    if (g.showMessage && msg == g.showMessage) {
+        if (wp == 1) g.resident = true;  // the user opened the app: it stays
         showWindow();
         return 0;
     }
@@ -139,20 +376,24 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == ID_SHOW) showWindow();
-        else if (LOWORD(wp) == ID_EXIT) DestroyWindow(hwnd);
+        onCommand(LOWORD(wp));
         return 0;
     case WM_TIMER:
         if (wp == TIMER_PROBE) {
             KillTimer(hwnd, TIMER_PROBE);
             writeProbe();
             DestroyWindow(hwnd);
+        } else if (wp == TIMER_POLL) {
+            checkIdleExit();
         }
         return 0;
     case WM_DPICHANGED: {  // moved to a monitor with a different scale
         const RECT *r = reinterpret_cast<const RECT *>(lp);
         SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        g.trayIconDpi = 0;
+        setTray(g.trayState, g.tip);
+        InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     }
     case WM_CLOSE:
@@ -165,9 +406,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetClientRect(hwnd, &rc);
         FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
         SetBkMode(dc, TRANSPARENT);
-        HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        HGDIOBJ old = SelectObject(dc, font);
-        DrawTextW(dc, L"Scriptorium (A0 spike)", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+        HGDIOBJ old = SelectObject(dc, uiFont());
+        DrawTextW(dc, L"진행 중인 작업이 없어요", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, old);
         EndPaint(hwnd, &ps);
         return 0;
@@ -183,27 +424,38 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
-    g_inst = inst;
+    g.inst = inst;
+    bool background = false;
+    std::wstring dataDirArg;
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; i++) {
-        if (std::wstring(argv[i]) == L"--probe" && i + 1 < argc) g_probeFile = argv[++i];
+        std::wstring a = argv[i];
+        if (a == L"--probe" && i + 1 < argc) g.probeFile = argv[++i];
+        else if (a == L"--data-dir" && i + 1 < argc) dataDirArg = argv[++i];
+        else if (a == L"--background") background = true;
     }
     LocalFree(argv);
+    g.probe = !g.probeFile.empty();
+    g.resident = !background && !g.probe;
+    g.paths = resolvePaths(dataDirArg);
 
-    g_showMessage = RegisterWindowMessageW(kShowMessageName);
+    g.showMessage = RegisterWindowMessageW(kShowMessageName);
     // A probe runs alongside a real instance, so it skips the single-instance check.
     HANDLE mutex = nullptr;
-    if (g_probeFile.empty()) {
+    if (!g.probe) {
         mutex = CreateMutexW(nullptr, TRUE, kMutexName);
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
-            // HWND_BROADCAST would reach every top-level window; find ours instead.
-            if (HWND other = FindWindowW(kWindowClass, nullptr)) {
-                DWORD pid = 0;
-                GetWindowThreadProcessId(other, &pid);
-                AllowSetForegroundWindow(pid);
-                PostMessageW(other, g_showMessage, 0, 0);
+            // Background launches only make sure the app runs; a user launch brings it forward.
+            if (!background) {
+                if (HWND other = FindWindowW(kWindowClass, nullptr)) {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(other, &pid);
+                    AllowSetForegroundWindow(pid);
+                    PostMessageW(other, g.showMessage, 1, 0);
+                }
             }
+            if (mutex) CloseHandle(mutex);
             return 0;
         }
     }
@@ -214,33 +466,37 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     WNDCLASSEXW wc{sizeof wc};
     wc.lpfnWndProc = wndProc;
     wc.hInstance = inst;
-    wc.hIcon = loadAppIcon(GetSystemMetrics(SM_CXICON));
-    wc.hIconSm = loadAppIcon(GetSystemMetrics(SM_CXSMICON));
+    wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                             GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                               GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = g_probeFile.empty() ? kWindowClass : L"Scriptorium.App.Probe";
+    wc.lpszClassName = g.probe ? kProbeClass : kWindowClass;
     RegisterClassExW(&wc);
 
-    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     // WS_EX_TOOLWINDOW keeps the window off the taskbar; the tray icon is the way in.
-    g_wnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Scriptorium",
-                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 340, 300,
-                            nullptr, nullptr, inst, nullptr);
-    if (!g_wnd) return 1;
+    g.wnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Scriptorium", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 340, 300, nullptr, nullptr, inst, nullptr);
+    if (!g.wnd) return 1;
     // Lets Explorer's TaskbarCreated broadcast through UIPI if we ever run elevated.
-    ChangeWindowMessageFilterEx(g_wnd, g_taskbarCreated, MSGFLT_ALLOW, nullptr);
-    ChangeWindowMessageFilterEx(g_wnd, g_showMessage, MSGFLT_ALLOW, nullptr);
-    UINT dpi = GetDpiForWindow(g_wnd);
-    SetWindowPos(g_wnd, nullptr, 0, 0, scaled(340, dpi), scaled(300, dpi), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ChangeWindowMessageFilterEx(g.wnd, g.taskbarCreated, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(g.wnd, g.showMessage, MSGFLT_ALLOW, nullptr);
+    UINT dpi = windowDpi();
+    SetWindowPos(g.wnd, nullptr, 0, 0, scaled(340, dpi), scaled(300, dpi), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     addTrayIcon();
-    if (!g_probeFile.empty()) SetTimer(g_wnd, TIMER_PROBE, 3000, nullptr);
-    else showWindow();
+    SetTimer(g.wnd, TIMER_POLL, 1000, nullptr);
+    if (g.probe) SetTimer(g.wnd, TIMER_PROBE, 3000, nullptr);
+    else if (g.resident) showWindow();
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    for (HICON i : g.trayIcons)
+        if (i) DestroyIcon(i);
     if (mutex) CloseHandle(mutex);
     return 0;
 }

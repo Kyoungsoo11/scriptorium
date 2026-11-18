@@ -42,6 +42,9 @@ Notes
   folders list | folders create <name> [--parent <id>] | folders delete <id>
   speakers rename <noteId> <SPEAKER_00> <name>
 
+App
+  app                              open the Scriptorium tray app (start recordings, see what is running)
+
 Setup
   devices                          audio devices
   doctor                           check that the engine and models are in place
@@ -599,6 +602,21 @@ function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
   }
 }
 
+// ---- app ---------------------------------------------------------------------
+
+/**
+ * Starts the tray app, or brings the running one forward (it allows one instance per session).
+ * The app watches env.dataDir, so a --data-dir given here reaches it too.
+ */
+function cmdApp(env) {
+  if (!fs.existsSync(env.appExe)) {
+    throw new Error(`The tray app is missing: ${env.appExe}. Build it with scripts\\build-app.cmd.`);
+  }
+  const child = spawn(env.appExe, ['--data-dir', env.dataDir], { detached: true, stdio: 'ignore' });
+  child.unref();
+  printJson({ app: env.appExe, pid: child.pid });
+}
+
 // ---- setup -------------------------------------------------------------------
 
 function cmdDevices(env) {
@@ -650,6 +668,7 @@ const COMMANDS = {
   notes: { values: ['folder', 'search', 'limit', 'format', 'out'], booleans: ['keep-audio'] },
   folders: { values: ['parent'] },
   speakers: {},
+  app: {},
   devices: {},
   doctor: {},
   'setup-claude': { values: ['config'], booleans: ['remove', 'dry-run'] },
@@ -699,6 +718,9 @@ async function main(argv = process.argv.slice(2)) {
         break;
       case 'speakers':
         cmdSpeakers(env, opts, positionals);
+        break;
+      case 'app':
+        cmdApp(env);
         break;
       case 'devices':
         cmdDevices(env);
