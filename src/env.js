@@ -7,6 +7,7 @@
 //   <root>/native/scriptorium-core.exe        <root>/build/whisper-<cpu|vulkan>/bin/scriptorium-core.exe
 //   <root>/models/*                  <root>/models/*
 //   <root>/runtime/node.exe          system node
+//   <root>/Scriptorium.exe           <root>/build/app/Scriptorium.exe   (tray app)
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -33,6 +34,12 @@ function nativeDir(opts) {
   return builds.find(d => fs.existsSync(path.join(d, 'scriptorium-core.exe'))) || builds[0];
 }
 
+/** The tray app (native/scriptorium-app.cpp). */
+function appExe() {
+  if (process.env.SCRIPTORIUM_APP) return path.resolve(process.env.SCRIPTORIUM_APP);
+  return PACKAGED ? path.join(ROOT, 'Scriptorium.exe') : path.join(ROOT, 'build', 'app', 'Scriptorium.exe');
+}
+
 function resolveEnv(opts = {}) {
   const modelsDir = path.resolve(opts['models-dir'] || process.env.SCRIPTORIUM_MODELS || path.join(ROOT, 'models'));
   // Not under AppData: the Microsoft Store build of Claude Desktop runs MCP servers in its
@@ -47,6 +54,7 @@ function resolveEnv(opts = {}) {
     runDir: path.join(dataDir, 'run'),
     nativeDir: native,
     coreExe: path.join(native, 'scriptorium-core.exe'),
+    appExe: appExe(),
     gpuBuild: fs.existsSync(path.join(native, 'ggml-vulkan.dll')),
     modelsDir,
     whisperModel: opts['whisper-model'] ? path.resolve(opts['whisper-model']) : path.join(modelsDir, MODEL_FILES.whisper),

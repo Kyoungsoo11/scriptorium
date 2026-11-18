@@ -14,6 +14,8 @@ const { WavWriter, rms } = require('./audio');
 const { decodeFile, Capture, listDevices } = require('./native');
 const { TranscriptionRun } = require('./transcriber');
 const { render, fromAltEntries, FORMATS } = require('./format');
+const { writeJsonAtomic, writeFinished, TranscribeState } = require('./activity');
+const { keepTrayApp } = require('./tray');
 
 const VERSION = require('../package.json').version;
 
@@ -42,10 +44,13 @@ Notes
   folders list | folders create <name> [--parent <id>] | folders delete <id>
   speakers rename <noteId> <SPEAKER_00> <name>
 
+App
+  app                              open the Scriptorium tray app (start recordings, see what is running)
+
 Setup
   devices                          audio devices
   doctor                           check that the engine and models are in place
-  setup-claude [--remove] [--dry-run] [--config <file>]
+  setup-claude [--remove [--if-own]] [--dry-run] [--config <file>]
                                    register Scriptorium with Claude Desktop (then restart Claude)
   mcp                              run as an MCP server on stdin/stdout (Claude Desktop starts this)
 
@@ -181,11 +186,23 @@ async function cmdTranscribe(env, opts, files) {
   const folder = store ? store.resolveFolder(opts.folder, { create: true }) : null;
   const stream = streamer(opts);
   const results = [];
+  // Shown by the tray app while this runs.
+  const activity = new TranscribeState(env, { count: files.length });
+  // Ctrl+C or a kill from MCP: leave no state file behind and say the file did not finish.
+  let current = null;
+  const onSignal = () => {
+    activity.close();
+    if (current) writeFinished(env, { kind: 'transcribe', ...current, ok: false, error: 'interrupted' });
+    process.exit(130);
+  };
+  const signals = ['SIGINT', 'SIGTERM', 'SIGBREAK'];
+  signals.forEach(s => process.on(s, onSignal));
   try {
-    for (const file of files) {
+    for (const [index, file] of files.entries()) {
       const abs = path.resolve(file);
       if (!fs.existsSync(abs)) throw new UsageError(`No such file: ${file}`);
       const title = opts.title || path.parse(abs).name;
+      current = { id: `${process.pid}-${index}`, title };
       let total = null;
       const run = new TranscriptionRun({
         env,
@@ -196,32 +213,46 @@ async function cmdTranscribe(env, opts, files) {
         onEvent: stream || undefined,
       });
       const started = Date.now();
-      await run.start();
+      const tick = () =>
+        activity.update({ totalSeconds: total, doneSeconds: Math.round(Math.min(run.transcribedSeconds, total ?? Infinity)) });
+      activity.update({ index, title, file: abs, phase: 'transcribing', totalSeconds: null, doneSeconds: 0 });
       const progress = setInterval(() => {
         const sec = run.transcribedSeconds;
         log(`  transcribed ${Math.round(sec)} s${total ? ` / ${Math.round(total)} s (${Math.round((sec / total) * 100)}%)` : ''}`);
       }, 15000);
+      const ticker = setInterval(tick, 2000);
       try {
+        await run.start();
         await decodeFile(env, abs, {
           onInfo: info => {
             total = info.duration > 0 ? info.duration : null;
             log(`transcribing ${path.basename(abs)}${total ? ` (${Math.round(total)} s)` : ''} on ${run.backend}`);
+            tick();
           },
           onChunk: chunk => run.feed(chunk),
         });
+        clearInterval(ticker);
+        activity.update({ phase: 'finishing' });
         const result = await run.finish();
         clearInterval(progress);
         result.sourcePath = abs;
         result.elapsedSeconds = Math.round((Date.now() - started) / 100) / 10;
         log(`done: ${result.segments.length} segments, ${result.speakers.length} speakers, ${result.elapsedSeconds} s`);
         deliver(result, opts, { stream, title });
+        writeFinished(env, { kind: 'transcribe', ...current, ok: true, noteId: result.noteId });
+        current = null;
         results.push(result);
       } catch (err) {
         clearInterval(progress);
+        clearInterval(ticker);
+        writeFinished(env, { kind: 'transcribe', ...current, ok: false, noteId: run.note?.id ?? null, error: err.message });
+        current = null;
         throw await run.fail(err);
       }
     }
   } finally {
+    signals.forEach(s => process.off(s, onSignal));
+    activity.close();
     store?.close();
   }
   return results;
@@ -264,6 +295,17 @@ function runningRecordings(env) {
 }
 
 async function cmdRecordDetached(env, opts, argv) {
+  // Check the options here, so a mistake is reported directly instead of as "did not start".
+  const options = transcriptionOptions(opts);
+  if (opts.duration) {
+    try {
+      parseDuration(opts.duration);
+    } catch (e) {
+      throw new UsageError(e.message);
+    }
+  }
+  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
+  requireModels(env, options);
   fs.mkdirSync(env.runDir, { recursive: true });
   const logFile = opts['log-file'] ? path.resolve(opts['log-file']) : path.join(env.runDir, `record-${Date.now()}.log`);
   const args = ['record', ...argv.filter(a => a !== '--detach' && a !== '--stream')];
@@ -286,7 +328,15 @@ async function cmdRecordDetached(env, opts, argv) {
     }
     if (!alive(child.pid)) break;
   }
-  throw new Error(`The background recorder did not start; see ${logFile}`);
+  // The recorder's own error line, when it wrote one, says more than "did not start".
+  let reason = '';
+  try {
+    const lines = fs.readFileSync(logFile, 'utf8').split(/\r?\n/).filter(l => l.startsWith('scriptorium: '));
+    if (lines.length) reason = `: ${lines[lines.length - 1].slice('scriptorium: '.length)}`;
+  } catch {
+    // no log
+  }
+  throw new Error(`The background recorder did not start${reason} (log: ${logFile})`);
 }
 
 const MUTED_WARNING =
@@ -361,26 +411,37 @@ async function cmdRecord(env, opts, argv) {
   capture.on('warning', m => log(`warning: ${m}`));
 
   // Mute / digital-silence state, kept in the state file so `status` (and the MCP tools) can show it.
+  // The tray app reads this file too; phase turns "finishing" once the recording was told to stop.
   const audioState = { microphoneMuted: null, microphoneSilent: false };
   let stateReady = false;
+  let phase = 'recording';
+  // Never throws: it runs inside capture event handlers, and a failed status update must not stop
+  // the recording (writeJsonAtomic already retries while a reader holds the file).
   const writeState = () => {
     if (!stateReady) return;
     const warnings = audioWarnings(audioState);
-    fs.writeFileSync(
-      statePath,
-      JSON.stringify({
-        pid: process.pid,
-        noteId: run.note?.id ?? null,
-        title,
-        startedAt: startedAt.toISOString(),
-        audioPath: wav?.file ?? null,
-        stopFile,
-        duration,
-        audio: audioState,
-        ...(warnings.length ? { warnings } : {}),
-      }),
-    );
+    try {
+      writeStateFile(warnings);
+    } catch (e) {
+      log(`warning: could not update ${statePath}: ${e.message}`);
+    }
   };
+  const writeStateFile = warnings =>
+    writeJsonAtomic(statePath, {
+      kind: 'recording',
+      phase,
+      pid: process.pid,
+      noteId: run.note?.id ?? null,
+      title,
+      startedAt: startedAt.toISOString(),
+      audioPath: wav?.file ?? null,
+      stopFile,
+      duration,
+      audio: audioState,
+      ...(warnings.length ? { warnings } : {}),
+    });
+  const finished = (ok, extra) =>
+    writeFinished(env, { kind: 'recording', id, title, ok, noteId: run.note?.id ?? null, ...extra });
   capture.on('started', msg => {
     audioState.microphoneMuted = msg.microphoneMuted ?? null;
     for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
@@ -426,6 +487,7 @@ async function cmdRecord(env, opts, argv) {
       timers.forEach(t => clearTimeout(t));
       wav?.close();
       store?.close();
+      finished(false, { error: err.message });
       throw await run.fail(err);
     }
     stateReady = true;
@@ -433,6 +495,8 @@ async function cmdRecord(env, opts, argv) {
     log(`recording "${title}"${duration ? ` for ${duration} s` : ''}; stop with "scriptorium stop" or Ctrl+C`);
     await stopped;
     log(`stopping (${stopReason})`);
+    phase = 'finishing';
+    writeState();
   } finally {
     timers.forEach(t => clearTimeout(t));
     await capture.stop();
@@ -448,8 +512,14 @@ async function cmdRecord(env, opts, argv) {
     result.startedAt = startedAt.toISOString();
     result.stopReason = stopReason;
     deliver(result, opts, { stream, title });
+    // A capture error still saves what was recorded, but the notice should say it went wrong.
+    finished(stopReason !== 'error', {
+      audioPath: result.audioPath,
+      ...(stopReason === 'error' ? { error: 'audio capture failed; what was recorded until then is saved' } : {}),
+    });
     if (stopReason === 'error') process.exitCode = 1;
   } catch (err) {
+    finished(false, { error: err.message });
     throw await run.fail(err);
   } finally {
     fs.rmSync(statePath, { force: true });
@@ -599,6 +669,36 @@ function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
   }
 }
 
+// ---- app ---------------------------------------------------------------------
+
+/** Runs work with the tray app kept running, so its icon shows however the work was started. */
+async function withTrayApp(env, work) {
+  const stop = keepTrayApp(env);
+  try {
+    return await work();
+  } finally {
+    stop();
+  }
+}
+
+/**
+ * Starts the tray app, or brings the running one forward (it allows one instance per session).
+ * The app watches env.dataDir, so a --data-dir given here reaches it too.
+ */
+async function cmdApp(env) {
+  if (!fs.existsSync(env.appExe)) {
+    throw new Error(`The tray app is missing: ${env.appExe}. Build it with scripts\\build-app.cmd.`);
+  }
+  const child = spawn(env.appExe, ['--data-dir', env.dataDir], { detached: true, stdio: 'ignore' });
+  // e.g. blocked by an application control policy: report it rather than print a pid
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve);
+    child.once('error', e => reject(new Error(`Could not start the tray app ${env.appExe}: ${e.message}`)));
+  });
+  child.unref();
+  printJson({ app: env.appExe, pid: child.pid });
+}
+
 // ---- setup -------------------------------------------------------------------
 
 function cmdDevices(env) {
@@ -650,9 +750,10 @@ const COMMANDS = {
   notes: { values: ['folder', 'search', 'limit', 'format', 'out'], booleans: ['keep-audio'] },
   folders: { values: ['parent'] },
   speakers: {},
+  app: {},
   devices: {},
   doctor: {},
-  'setup-claude': { values: ['config'], booleans: ['remove', 'dry-run'] },
+  'setup-claude': { values: ['config'], booleans: ['remove', 'if-own', 'dry-run'] },
   mcp: {},
 };
 
@@ -680,10 +781,12 @@ async function main(argv = process.argv.slice(2)) {
     const env = resolveEnv(opts);
     switch (command) {
       case 'transcribe':
-        await cmdTranscribe(env, opts, positionals);
+        await withTrayApp(env, () => cmdTranscribe(env, opts, positionals));
         break;
       case 'record':
-        await cmdRecord(env, opts, rest);
+        // --detach only starts the recorder, which then keeps the app itself
+        if (opts.detach) await cmdRecord(env, opts, rest);
+        else await withTrayApp(env, () => cmdRecord(env, opts, rest));
         break;
       case 'stop':
         await cmdStop(env, opts);
@@ -700,6 +803,9 @@ async function main(argv = process.argv.slice(2)) {
       case 'speakers':
         cmdSpeakers(env, opts, positionals);
         break;
+      case 'app':
+        await cmdApp(env);
+        break;
       case 'devices':
         cmdDevices(env);
         break;
@@ -707,7 +813,14 @@ async function main(argv = process.argv.slice(2)) {
         cmdDoctor(env);
         break;
       case 'setup-claude':
-        printJson(require('./claude').setupClaude(env, { configPath: opts.config, remove: opts.remove, dryRun: opts['dry-run'] }));
+        printJson(
+          require('./claude').setupClaude(env, {
+            configPath: opts.config,
+            remove: opts.remove,
+            ifOwn: opts['if-own'],
+            dryRun: opts['dry-run'],
+          }),
+        );
         break;
       case 'mcp':
         await require('./mcp').serve(opts);

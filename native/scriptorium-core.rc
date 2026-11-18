@@ -5,8 +5,8 @@
 1 ICON "scriptorium.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 0,3,2,0
-PRODUCTVERSION 0,3,2,0
+FILEVERSION 0,4,0,0
+PRODUCTVERSION 0,4,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Scriptorium"
             VALUE "FileDescription", "Scriptorium"
-            VALUE "FileVersion", "0.3.2"
+            VALUE "FileVersion", "0.4.0"
             VALUE "InternalName", "scriptorium-core"
             VALUE "OriginalFilename", "scriptorium-core.exe"
             VALUE "ProductName", "Scriptorium"
-            VALUE "ProductVersion", "0.3.2"
+            VALUE "ProductVersion", "0.4.0"
         END
     END
     BLOCK "VarFileInfo"

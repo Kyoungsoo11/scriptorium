@@ -89,3 +89,123 @@ test('Store keeps notes, folders, transcripts and search', () => {
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('app command reports a missing tray app instead of failing silently', () => {
+  const { spawnSync } = require('node:child_process');
+  const missing = path.join(os.tmpdir(), `scriptorium-no-app-${process.pid}.exe`);
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'scriptorium.js'), 'app'], {
+    env: { ...process.env, SCRIPTORIUM_APP: missing },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /tray app is missing/);
+  assert.match(r.stderr, /scripts\\build-app\.cmd/);
+});
+
+test('resolveEnv points at the tray app', () => {
+  const { resolveEnv } = require('../src/env');
+  assert.equal(path.basename(resolveEnv().appExe), 'Scriptorium.exe');
+});
+
+test('activity files: transcribe state is written whole and removed, finished notices are safe names', () => {
+  const { writeFinished, TranscribeState } = require('../src/activity');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-run-'));
+  const env = { runDir: path.join(dir, 'run') };
+
+  const state = new TranscribeState(env, { count: 2 });
+  state.update({ index: 1, title: '3주차', phase: 'transcribing', totalSeconds: 100, doneSeconds: 40 });
+  const written = JSON.parse(fs.readFileSync(state.file, 'utf8'));
+  assert.equal(written.kind, 'transcribe');
+  assert.equal(written.pid, process.pid);
+  assert.equal(written.count, 2);
+  assert.equal(written.doneSeconds, 40);
+  assert.deepEqual(fs.readdirSync(env.runDir).filter(f => f.endsWith('.tmp')), []);
+  state.close();
+  assert.equal(fs.existsSync(state.file), false);
+
+  writeFinished(env, { kind: 'recording', id: 'a/b:c', title: '회의', ok: false, error: 'x'.repeat(900) });
+  const files = fs.readdirSync(env.runDir);
+  assert.deepEqual(files, ['finished-recording-a_b_c.json']);
+  const notice = JSON.parse(fs.readFileSync(path.join(env.runDir, files[0]), 'utf8'));
+  assert.equal(notice.ok, false);
+  assert.equal(notice.error.length, 500);
+  assert.equal(notice.title, '회의');
+
+  // never throws, even when the folder cannot be written
+  writeFinished({ runDir: path.join(dir, 'run', files[0]) }, { kind: 'transcribe', id: 1, title: 't', ok: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('writeJsonAtomic waits out a reader that holds the file open (Windows rename EPERM)', async () => {
+  const { spawn } = require('node:child_process');
+  const { writeJsonAtomic } = require('../src/activity');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-atomic-'));
+  const file = path.join(dir, 'recording-x.json');
+  fs.writeFileSync(file, '{"v":0}');
+  // another process opens the file (as the tray app does every second) and keeps it for 300 ms
+  const holder = spawn(process.execPath, [
+    '-e',
+    `const fs=require('fs');const fd=fs.openSync(${JSON.stringify(file)},'r');process.stdout.write('open');setTimeout(()=>fs.closeSync(fd),300);`,
+  ]);
+  await new Promise(r => holder.stdout.once('data', r));
+  writeJsonAtomic(file, { v: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { v: 1 });
+  assert.deepEqual(fs.readdirSync(dir), ['recording-x.json']);
+  await new Promise(r => holder.once('exit', r));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('record --detach rejects a bad option before starting anything', () => {
+  const { spawnSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-detach-'));
+  const cli = path.join(__dirname, '..', 'bin', 'scriptorium.js');
+  const run = (...args) => spawnSync(process.execPath, [cli, 'record', '--detach', '--data-dir', dir, ...args], { encoding: 'utf8' });
+  let r = run('--duration', 'soon');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /soon/);
+  r = run('--mic', 'none', '--no-system');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /Nothing to record/);
+  assert.equal(fs.existsSync(path.join(dir, 'run')), false, 'no recorder was started');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('keepTrayApp starts the app only while it is not running, and stops checking when asked', async () => {
+  const { keepTrayApp, trayAppRunning } = require('../src/tray');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-tray-'));
+  const env = { runDir: path.join(dir, 'run'), dataDir: dir, appExe: process.execPath };
+  fs.mkdirSync(env.runDir);
+  const saved = process.env.SCRIPTORIUM_NO_GUI;
+  delete process.env.SCRIPTORIUM_NO_GUI;
+  try {
+    assert.equal(trayAppRunning(env), false);
+    fs.writeFileSync(path.join(env.runDir, 'app.json'), JSON.stringify({ pid: process.pid }));
+    assert.equal(trayAppRunning(env), true);
+    fs.writeFileSync(path.join(env.runDir, 'app.json'), JSON.stringify({ pid: 2 ** 31 - 2 }));
+    assert.equal(trayAppRunning(env), false, 'a dead pid is not a running app');
+
+    let launches = 0;
+    let up = false;
+    const stop = keepTrayApp(env, { launch: () => launches++, running: () => up, intervalMs: 20 });
+    assert.equal(launches, 1, 'checks at once');
+    up = true;
+    await new Promise(r => setTimeout(r, 70));
+    assert.equal(launches, 1, 'no launch while the app runs');
+    up = false;
+    await new Promise(r => setTimeout(r, 70));
+    assert.ok(launches >= 2, 'relaunched after the app went away');
+    stop();
+    const after = launches;
+    await new Promise(r => setTimeout(r, 70));
+    assert.equal(launches, after, 'stopped');
+
+    process.env.SCRIPTORIUM_NO_GUI = '1';
+    let off = 0;
+    keepTrayApp(env, { launch: () => off++, running: () => false, intervalMs: 20 })();
+    assert.equal(off, 0, 'SCRIPTORIUM_NO_GUI=1 turns it off');
+  } finally {
+    if (saved === undefined) delete process.env.SCRIPTORIUM_NO_GUI;
+    else process.env.SCRIPTORIUM_NO_GUI = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -55,9 +55,9 @@ function serverEntry(env) {
 }
 
 /**
- * @returns {object} what was done: { config, action: added|updated|unchanged|removed|absent, backup, entry }
+ * @returns {object} what was done: { config, action: added|updated|unchanged|removed|absent|kept, backup, entry }
  */
-function setupClaude(env, { configPath, remove = false, dryRun = false } = {}) {
+function setupClaude(env, { configPath, remove = false, ifOwn = false, dryRun = false } = {}) {
   const found = configPath ? { path: path.resolve(configPath), others: [], created: !fs.existsSync(configPath) } : findConfig();
   if (!found) {
     throw new Error(
@@ -79,6 +79,10 @@ function setupClaude(env, { configPath, remove = false, dryRun = false } = {}) {
   let entry = null;
   if (remove) {
     if (!before) return { config: found.path, action: 'absent' };
+    // the uninstaller passes ifOwn: an entry another Scriptorium copy registered stays
+    if (ifOwn && !(before.args || []).some(a => path.resolve(a) === path.resolve(CLI))) {
+      return { config: found.path, action: 'kept', reason: 'registered by another Scriptorium copy', entry: before };
+    }
     delete servers[SERVER_NAME];
     action = 'removed';
   } else {
