@@ -14,6 +14,7 @@ const { WavWriter, rms } = require('./audio');
 const { decodeFile, Capture, listDevices } = require('./native');
 const { TranscriptionRun } = require('./transcriber');
 const { render, fromAltEntries, FORMATS } = require('./format');
+const { writeJsonAtomic, writeFinished, TranscribeState } = require('./activity');
 
 const VERSION = require('../package.json').version;
 
@@ -184,8 +185,10 @@ async function cmdTranscribe(env, opts, files) {
   const folder = store ? store.resolveFolder(opts.folder, { create: true }) : null;
   const stream = streamer(opts);
   const results = [];
+  // Shown by the tray app while this runs.
+  const activity = new TranscribeState(env, { count: files.length });
   try {
-    for (const file of files) {
+    for (const [index, file] of files.entries()) {
       const abs = path.resolve(file);
       if (!fs.existsSync(abs)) throw new UsageError(`No such file: ${file}`);
       const title = opts.title || path.parse(abs).name;
@@ -199,32 +202,50 @@ async function cmdTranscribe(env, opts, files) {
         onEvent: stream || undefined,
       });
       const started = Date.now();
-      await run.start();
+      const tick = () =>
+        activity.update({ totalSeconds: total, doneSeconds: Math.round(Math.min(run.transcribedSeconds, total ?? Infinity)) });
+      activity.update({ index, title, file: abs, phase: 'transcribing', totalSeconds: null, doneSeconds: 0 });
       const progress = setInterval(() => {
         const sec = run.transcribedSeconds;
         log(`  transcribed ${Math.round(sec)} s${total ? ` / ${Math.round(total)} s (${Math.round((sec / total) * 100)}%)` : ''}`);
       }, 15000);
+      const ticker = setInterval(tick, 2000);
       try {
+        await run.start();
         await decodeFile(env, abs, {
           onInfo: info => {
             total = info.duration > 0 ? info.duration : null;
             log(`transcribing ${path.basename(abs)}${total ? ` (${Math.round(total)} s)` : ''} on ${run.backend}`);
+            tick();
           },
           onChunk: chunk => run.feed(chunk),
         });
+        clearInterval(ticker);
+        activity.update({ phase: 'finishing' });
         const result = await run.finish();
         clearInterval(progress);
         result.sourcePath = abs;
         result.elapsedSeconds = Math.round((Date.now() - started) / 100) / 10;
         log(`done: ${result.segments.length} segments, ${result.speakers.length} speakers, ${result.elapsedSeconds} s`);
+        writeFinished(env, { kind: 'transcribe', id: `${process.pid}-${index}`, title, ok: true, noteId: result.noteId });
         deliver(result, opts, { stream, title });
         results.push(result);
       } catch (err) {
         clearInterval(progress);
+        clearInterval(ticker);
+        writeFinished(env, {
+          kind: 'transcribe',
+          id: `${process.pid}-${index}`,
+          title,
+          ok: false,
+          noteId: run.note?.id ?? null,
+          error: err.message,
+        });
         throw await run.fail(err);
       }
     }
   } finally {
+    activity.close();
     store?.close();
   }
   return results;
@@ -364,26 +385,29 @@ async function cmdRecord(env, opts, argv) {
   capture.on('warning', m => log(`warning: ${m}`));
 
   // Mute / digital-silence state, kept in the state file so `status` (and the MCP tools) can show it.
+  // The tray app reads this file too; phase turns "finishing" once the recording was told to stop.
   const audioState = { microphoneMuted: null, microphoneSilent: false };
   let stateReady = false;
+  let phase = 'recording';
   const writeState = () => {
     if (!stateReady) return;
     const warnings = audioWarnings(audioState);
-    fs.writeFileSync(
-      statePath,
-      JSON.stringify({
-        pid: process.pid,
-        noteId: run.note?.id ?? null,
-        title,
-        startedAt: startedAt.toISOString(),
-        audioPath: wav?.file ?? null,
-        stopFile,
-        duration,
-        audio: audioState,
-        ...(warnings.length ? { warnings } : {}),
-      }),
-    );
+    writeJsonAtomic(statePath, {
+      kind: 'recording',
+      phase,
+      pid: process.pid,
+      noteId: run.note?.id ?? null,
+      title,
+      startedAt: startedAt.toISOString(),
+      audioPath: wav?.file ?? null,
+      stopFile,
+      duration,
+      audio: audioState,
+      ...(warnings.length ? { warnings } : {}),
+    });
   };
+  const finished = (ok, extra) =>
+    writeFinished(env, { kind: 'recording', id, title, ok, noteId: run.note?.id ?? null, ...extra });
   capture.on('started', msg => {
     audioState.microphoneMuted = msg.microphoneMuted ?? null;
     for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
@@ -429,6 +453,7 @@ async function cmdRecord(env, opts, argv) {
       timers.forEach(t => clearTimeout(t));
       wav?.close();
       store?.close();
+      finished(false, { error: err.message });
       throw await run.fail(err);
     }
     stateReady = true;
@@ -436,6 +461,8 @@ async function cmdRecord(env, opts, argv) {
     log(`recording "${title}"${duration ? ` for ${duration} s` : ''}; stop with "scriptorium stop" or Ctrl+C`);
     await stopped;
     log(`stopping (${stopReason})`);
+    phase = 'finishing';
+    writeState();
   } finally {
     timers.forEach(t => clearTimeout(t));
     await capture.stop();
@@ -450,9 +477,15 @@ async function cmdRecord(env, opts, argv) {
     result.audioPath = audio?.path ?? null;
     result.startedAt = startedAt.toISOString();
     result.stopReason = stopReason;
+    // A capture error still saves what was recorded, but the notice should say it went wrong.
+    finished(stopReason !== 'error', {
+      audioPath: result.audioPath,
+      ...(stopReason === 'error' ? { error: 'audio capture failed; what was recorded until then is saved' } : {}),
+    });
     deliver(result, opts, { stream, title });
     if (stopReason === 'error') process.exitCode = 1;
   } catch (err) {
+    finished(false, { error: err.message });
     throw await run.fail(err);
   } finally {
     fs.rmSync(statePath, { force: true });

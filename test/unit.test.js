@@ -106,3 +106,32 @@ test('resolveEnv points at the tray app', () => {
   const { resolveEnv } = require('../src/env');
   assert.equal(path.basename(resolveEnv().appExe), 'Scriptorium.exe');
 });
+
+test('activity files: transcribe state is written whole and removed, finished notices are safe names', () => {
+  const { writeFinished, TranscribeState } = require('../src/activity');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-run-'));
+  const env = { runDir: path.join(dir, 'run') };
+
+  const state = new TranscribeState(env, { count: 2 });
+  state.update({ index: 1, title: '3주차', phase: 'transcribing', totalSeconds: 100, doneSeconds: 40 });
+  const written = JSON.parse(fs.readFileSync(state.file, 'utf8'));
+  assert.equal(written.kind, 'transcribe');
+  assert.equal(written.pid, process.pid);
+  assert.equal(written.count, 2);
+  assert.equal(written.doneSeconds, 40);
+  assert.deepEqual(fs.readdirSync(env.runDir).filter(f => f.endsWith('.tmp')), []);
+  state.close();
+  assert.equal(fs.existsSync(state.file), false);
+
+  writeFinished(env, { kind: 'recording', id: 'a/b:c', title: '회의', ok: false, error: 'x'.repeat(900) });
+  const files = fs.readdirSync(env.runDir);
+  assert.deepEqual(files, ['finished-recording-a_b_c.json']);
+  const notice = JSON.parse(fs.readFileSync(path.join(env.runDir, files[0]), 'utf8'));
+  assert.equal(notice.ok, false);
+  assert.equal(notice.error.length, 500);
+  assert.equal(notice.title, '회의');
+
+  // never throws, even when the folder cannot be written
+  writeFinished({ runDir: path.join(dir, 'run', files[0]) }, { kind: 'transcribe', id: 1, title: 't', ok: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
