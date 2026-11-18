@@ -21,8 +21,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cwchar>
+#include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "app/json.h"
@@ -50,8 +52,28 @@ enum MenuId : UINT {
 constexpr UINT kRowIds = 4;
 constexpr UINT ID_EMPTY = 1900;
 constexpr UINT ID_RUNNING_HEADER = 1901;
+// the new-recording form
+enum FormId : UINT {
+    ID_NEW_HEADER = 3000,
+    ID_LABEL,  // all field labels share it
+    ID_TITLE,
+    ID_FOLDER,
+    ID_SOURCE,
+    ID_MIC,
+    ID_LANG,
+    ID_ADVANCED,
+    ID_SPEAKERS,
+    ID_DURATION,
+    ID_PROMPT,
+    ID_START,
+    ID_FORM_STATUS,
+};
+constexpr int kClientWidth = 360;  // at 96 DPI
 
-enum TimerId : UINT_PTR { TIMER_PROBE = 1, TIMER_POLL };
+constexpr UINT WM_LISTS_LOADED = WM_APP + 2;  // lParam: Lists* from a worker thread
+constexpr UINT WM_START_DONE = WM_APP + 3;    // lParam: StartResult* from a worker thread
+
+enum TimerId : UINT_PTR { TIMER_PROBE = 1, TIMER_POLL, TIMER_CLEAR_STATUS };
 constexpr ULONGLONG kIdleExitMs = 15000;           // background mode: linger so the last notice can be read
 constexpr ULONGLONG kStaleNoticeMs = 10 * 60 * 1000;  // notices older than this at start-up are dropped
 
@@ -192,7 +214,7 @@ struct App {
     std::vector<std::wstring> menuStopKeys;  // recordings listed in the open tray menu
 
     std::vector<Row> rows;
-    std::wstring rowsShape;  // keys + stop-button visibility the rows were built for
+    std::wstring rowsShape = L"\x1";  // keys + stop-button visibility the rows were built for (none yet)
     HWND runningHeader = nullptr, emptyLabel = nullptr;
 } g;
 
@@ -402,7 +424,11 @@ std::wstring statusText(const Activity &a, bool *warn) {
     return s;
 }
 
-/** Height of the client area; positions every control. Extended by the new-recording form. */
+int layoutForm(int m, int y, int w);
+void requestLists();
+void poll();
+
+/** Height of the client area; positions every control: running work on top, the new-recording form below. */
 int layout() {
     ensureFonts();
     RECT rc;
@@ -422,13 +448,14 @@ int layout() {
         if (r.stop) SetWindowPos(r.stop, nullptr, m + w - stopW, y + (2 * lineH - stopH) / 2, stopW, stopH, SWP_NOZORDER);
         y += 2 * lineH + S(10);
     }
-    return y + m - S(10) + S(4);
+    if (!g.rows.empty()) y -= S(4);
+    return layoutForm(m, y + S(6), w) + m;
 }
 
 /** Sizes the window to its content (fixed width), keeping its bottom edge where it was. */
 void fitWindow() {
     UINT dpi = windowDpi();
-    int clientW = scaled(340, dpi);
+    int clientW = scaled(kClientWidth, dpi);
     // lay out once at the right width so the height is right
     RECT wr;
     GetWindowRect(g.wnd, &wr);
@@ -442,6 +469,9 @@ void fitWindow() {
     if (wr.bottom - wr.top != h)
         SetWindowPos(g.wnd, nullptr, wr.left, wr.bottom - h, frameW, h, SWP_NOZORDER | SWP_NOACTIVATE);
     layout();
+    // Moved controls leave their old pixels behind otherwise (WS_CLIPCHILDREN keeps the parent
+    // from painting under them while they move).
+    RedrawWindow(g.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 /** Rebuilds the rows when the set of activities (or which have a stop button) changed; else updates text. */
@@ -501,7 +531,10 @@ void placeNearTray() {
 void showWindow() {
     // Not SW_SHOWNORMAL: on a process's first ShowWindow call Windows replaces SW_SHOWNORMAL with
     // the launcher's STARTUPINFO show state, which started the window minimized in testing.
-    if (!IsWindowVisible(g.wnd)) placeNearTray();
+    if (!IsWindowVisible(g.wnd)) {
+        placeNearTray();
+        requestLists();  // microphones and folders may have changed while it was hidden
+    }
     ShowWindow(g.wnd, SW_SHOW);
     if (IsIconic(g.wnd)) ShowWindow(g.wnd, SW_RESTORE);
     SetForegroundWindow(g.wnd);
@@ -510,6 +543,353 @@ void showWindow() {
 void openDataFolder() {
     makeDirs(g.paths.dataDir);
     ShellExecuteW(g.wnd, L"open", g.paths.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// ---- new-recording form -----------------------------------------------------------------
+
+/** What the user picked last time, kept in <data>\gui.json. */
+struct Settings {
+    int source = 0;  // 0 microphone + computer audio, 1 computer audio only, 2 microphone only
+    std::wstring mic = L"default";
+    std::wstring lang = L"ko";
+    std::wstring folder;
+    bool advanced = false;
+};
+
+struct Form {
+    HWND header = nullptr;
+    std::vector<HWND> labels;  // 제목, 폴더, 소리, 마이크, 언어, 화자 수, 시간 제한, 단어 힌트
+    HWND title = nullptr, folder = nullptr, source = nullptr, mic = nullptr, lang = nullptr;
+    HWND advanced = nullptr, speakers = nullptr, duration = nullptr, prompt = nullptr;
+    HWND start = nullptr, status = nullptr;
+    bool statusError = false;
+    std::vector<std::wstring> micIds;  // parallel to the mic combo's items
+    bool starting = false;
+    bool listsLoading = false;
+    Settings settings;
+} form;
+
+const wchar_t *kLanguages[][2] = {{L"ko", L"한국어"}, {L"en", L"영어"}, {L"auto", L"자동 감지"}};
+const wchar_t *kSources[] = {L"마이크 + 컴퓨터 소리", L"컴퓨터 소리만", L"마이크만"};
+
+std::wstring windowText(HWND h) {
+    int n = GetWindowTextLengthW(h);
+    std::wstring s(n, L'\0');
+    if (n) GetWindowTextW(h, s.data(), n + 1);
+    // trim spaces at both ends
+    size_t a = s.find_first_not_of(L" \t\r\n"), b = s.find_last_not_of(L" \t\r\n");
+    return a == std::wstring::npos ? std::wstring() : s.substr(a, b - a + 1);
+}
+
+std::wstring settingsPath() { return joinPath(g.paths.dataDir, L"gui.json"); }
+
+void loadSettings() {
+    bool ok = false;
+    std::string text = readFile(settingsPath(), &ok);
+    Json j;
+    if (!ok || !parseJson(text, j) || j.type != Json::Object) return;
+    Settings &s = form.settings;
+    s.source = std::clamp((int)j.number(L"source", 0), 0, 2);
+    s.mic = j.text(L"mic", L"default");
+    s.lang = j.text(L"lang", L"ko");
+    s.folder = j.text(L"folder");
+    s.advanced = j.flag(L"advanced");
+}
+
+void saveSettings() {
+    const Settings &s = form.settings;
+    std::string json = "{\"source\":" + std::to_string(s.source) + ",\"mic\":" + jsonString(s.mic) +
+                       ",\"lang\":" + jsonString(s.lang) + ",\"folder\":" + jsonString(s.folder) +
+                       ",\"advanced\":" + (s.advanced ? "true" : "false") + "}\n";
+    makeDirs(g.paths.dataDir);
+    writeFileAtomic(settingsPath(), json);
+}
+
+void setFormStatus(const std::wstring &text, bool error) {
+    form.statusError = error;
+    SetWindowTextW(form.status, text.c_str());
+    InvalidateRect(form.status, nullptr, TRUE);
+    KillTimer(g.wnd, TIMER_CLEAR_STATUS);
+    fitWindow();
+}
+
+void updateFormEnabled() {
+    int source = (int)SendMessageW(form.source, CB_GETCURSEL, 0, 0);
+    EnableWindow(form.mic, source != 1);  // computer audio only: no microphone to pick
+    EnableWindow(form.start, !form.starting);
+}
+
+void createForm() {
+    ensureFonts();
+    auto label = [](const wchar_t *text) {
+        form.labels.push_back(makeChild(L"STATIC", text, SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE, ID_LABEL, g.font));
+    };
+    auto edit = [](UINT id, const wchar_t *cue, DWORD extra = 0) {
+        HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
+                                 0, 0, 0, 0, g.wnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), g.inst, nullptr);
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), FALSE);
+        SendMessageW(h, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue));
+        return h;
+    };
+    auto combo = [](UINT id, DWORD style) {
+        return makeChild(L"COMBOBOX", L"", style | WS_TABSTOP | WS_VSCROLL, id, g.font);
+    };
+
+    form.header = makeChild(L"STATIC", L"새 녹음", SS_LEFT | SS_NOPREFIX, ID_NEW_HEADER, g.boldFont);
+    label(L"제목");
+    form.title = edit(ID_TITLE, L"비워두면 날짜와 시간");
+    label(L"폴더");
+    form.folder = combo(ID_FOLDER, CBS_DROPDOWN | CBS_AUTOHSCROLL);
+    if (HWND inner = FindWindowExW(form.folder, nullptr, L"Edit", nullptr))
+        SendMessageW(inner, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"폴더 없음 (새 이름이면 만들어요)"));
+    label(L"소리");
+    form.source = combo(ID_SOURCE, CBS_DROPDOWNLIST);
+    for (const wchar_t *s : kSources) SendMessageW(form.source, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    label(L"마이크");
+    form.mic = combo(ID_MIC, CBS_DROPDOWNLIST);
+    SendMessageW(form.mic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"기본 마이크"));
+    form.micIds = {L"default"};
+    label(L"언어");
+    form.lang = combo(ID_LANG, CBS_DROPDOWNLIST);
+    for (auto &l : kLanguages) SendMessageW(form.lang, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(l[1]));
+    form.advanced = makeChild(L"BUTTON", L"고급 설정", BS_AUTOCHECKBOX | WS_TABSTOP, ID_ADVANCED, g.font);
+    label(L"화자 수");
+    form.speakers = edit(ID_SPEAKERS, L"자동", ES_NUMBER);
+    label(L"시간 제한");
+    form.duration = edit(ID_DURATION, L"없음 (예: 50m, 1h30m)");
+    label(L"단어 힌트");
+    form.prompt = edit(ID_PROMPT, L"전문 용어를 쉼표로 (예: 세마포어, LRU)");
+    form.start = makeChild(L"BUTTON", L"녹음 시작", BS_DEFPUSHBUTTON | WS_TABSTOP, ID_START, g.font);
+    form.status = makeChild(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, ID_FORM_STATUS, g.font);
+
+    const Settings &s = form.settings;
+    SendMessageW(form.source, CB_SETCURSEL, s.source, 0);
+    SendMessageW(form.mic, CB_SETCURSEL, 0, 0);
+    int lang = 0;
+    for (int i = 0; i < (int)std::size(kLanguages); i++)
+        if (s.lang == kLanguages[i][0]) lang = i;
+    SendMessageW(form.lang, CB_SETCURSEL, lang, 0);
+    SetWindowTextW(form.folder, s.folder.c_str());
+    Button_SetCheck(form.advanced, s.advanced ? BST_CHECKED : BST_UNCHECKED);
+    updateFormEnabled();
+}
+
+int layoutForm(int m, int y, int w) {
+    if (!form.header) return y;
+    const int labelW = S(68), fieldX = m + labelW, fieldW = w - labelW, rowH = S(26), gap = S(6);
+    SetWindowPos(form.header, nullptr, m, y, w, S(20), SWP_NOZORDER);
+    y += S(26);
+    bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
+    HWND fields[] = {form.title, form.folder, form.source, form.mic, form.lang};
+    for (int i = 0; i < 5; i++) {
+        SetWindowPos(form.labels[i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
+        // a combo box's height includes its drop-down list
+        bool isCombo = fields[i] != form.title;
+        SetWindowPos(fields[i], nullptr, fieldX, y, fieldW, isCombo ? S(240) : rowH, SWP_NOZORDER);
+        y += rowH + gap;
+    }
+    SetWindowPos(form.advanced, nullptr, fieldX, y, fieldW, S(22), SWP_NOZORDER);
+    y += S(22) + gap;
+    HWND extra[] = {form.speakers, form.duration, form.prompt};
+    for (int i = 0; i < 3; i++) {
+        ShowWindow(form.labels[5 + i], advanced ? SW_SHOW : SW_HIDE);
+        ShowWindow(extra[i], advanced ? SW_SHOW : SW_HIDE);
+        if (!advanced) continue;
+        SetWindowPos(form.labels[5 + i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
+        SetWindowPos(extra[i], nullptr, fieldX, y, i == 0 ? S(80) : fieldW, rowH, SWP_NOZORDER);
+        y += rowH + gap;
+    }
+    y += S(4);
+    const int startW = S(116), startH = S(30);
+    SetWindowPos(form.start, nullptr, m + w - startW, y, startW, startH, SWP_NOZORDER);
+    y += startH;
+    if (GetWindowTextLengthW(form.status)) {
+        // measure the status text so long errors wrap instead of being cut off
+        std::wstring text = windowText(form.status);
+        HDC dc = GetDC(form.status);
+        HGDIOBJ old = SelectObject(dc, g.font);
+        RECT r{0, 0, w, 0};
+        DrawTextW(dc, text.c_str(), -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(form.status, dc);
+        int h = std::min<int>(r.bottom, S(120));
+        SetWindowPos(form.status, nullptr, m, y + S(8), w, h, SWP_NOZORDER);
+        ShowWindow(form.status, SW_SHOW);
+        y += S(8) + h;
+    } else {
+        ShowWindow(form.status, SW_HIDE);
+    }
+    return y;
+}
+
+// -- device and folder lists, loaded off the UI thread through the CLI --
+
+struct Lists {
+    bool devicesOk = false, foldersOk = false;
+    std::vector<std::pair<std::wstring, std::wstring>> mics;  // id, label
+    std::wstring defaultMic;
+    std::vector<std::wstring> folders;
+};
+
+std::vector<std::wstring> cliArgs(std::initializer_list<std::wstring> rest) {
+    std::vector<std::wstring> a = {g.paths.node, g.paths.cli};
+    a.insert(a.end(), rest.begin(), rest.end());
+    a.push_back(L"--data-dir");
+    a.push_back(g.paths.dataDir);
+    return a;
+}
+
+bool cliReady() { return fileExists(g.paths.node) && fileExists(g.paths.cli); }
+
+void requestLists() {
+    if (form.listsLoading || !cliReady()) return;
+    form.listsLoading = true;
+    std::vector<std::wstring> devices = cliArgs({L"devices"}), folders = cliArgs({L"folders", L"list"});
+    HWND wnd = g.wnd;
+    std::thread([wnd, devices, folders] {
+        auto *lists = new Lists();
+        RunResult d = runAndCapture(devices, 30000);
+        Json j;
+        if (d.exitCode == 0 && parseJson(d.out, j)) {
+            if (const Json *audio = j.get(L"audio"); audio && audio->type == Json::Array) {
+                lists->devicesOk = true;
+                for (const Json &dev : audio->arr) {
+                    if (!dev.flag(L"input")) continue;
+                    std::wstring name = dev.text(L"name");
+                    if (dev.flag(L"default")) lists->defaultMic = name;
+                    lists->mics.emplace_back(dev.text(L"id"), name + (dev.flag(L"muted") ? L" (음소거됨)" : L""));
+                }
+            }
+        }
+        RunResult fo = runAndCapture(folders, 30000);
+        Json k;
+        if (fo.exitCode == 0 && parseJson(fo.out, k) && k.type == Json::Array) {
+            lists->foldersOk = true;
+            for (const Json &folder : k.arr) lists->folders.push_back(folder.text(L"name"));
+        }
+        if (!PostMessageW(wnd, WM_LISTS_LOADED, 0, reinterpret_cast<LPARAM>(lists))) delete lists;
+    }).detach();
+}
+
+void applyLists(std::unique_ptr<Lists> lists) {
+    form.listsLoading = false;
+    if (lists->devicesOk) {
+        std::wstring current = form.micIds[std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0))];
+        if (form.micIds.size() == 1) current = form.settings.mic;  // first load: the saved choice
+        SendMessageW(form.mic, CB_RESETCONTENT, 0, 0);
+        form.micIds = {L"default"};
+        std::wstring def = lists->defaultMic.empty() ? L"기본 마이크" : L"기본 마이크 (" + lists->defaultMic + L")";
+        SendMessageW(form.mic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(def.c_str()));
+        int sel = 0;
+        for (auto &[id, label] : lists->mics) {
+            SendMessageW(form.mic, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+            if (id == current) sel = (int)form.micIds.size();
+            form.micIds.push_back(id);
+        }
+        SendMessageW(form.mic, CB_SETCURSEL, sel, 0);
+    }
+    if (lists->foldersOk) {
+        std::wstring text = windowText(form.folder);
+        SendMessageW(form.folder, CB_RESETCONTENT, 0, 0);
+        for (const auto &name : lists->folders) SendMessageW(form.folder, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
+        SetWindowTextW(form.folder, text.c_str());
+    }
+}
+
+// -- starting a recording --
+
+struct StartResult {
+    bool ok = false;
+    std::wstring title, message;
+};
+
+/** "Recording 2026-11-18 14:30", like the CLI's default, plus " (2)" if that title is already running. */
+std::wstring defaultTitle() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buf[64];
+    swprintf_s(buf, L"Recording %04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    std::wstring base = buf, title = base;
+    for (int n = 2;; n++) {
+        bool taken = std::any_of(g.activities.begin(), g.activities.end(), [&](const Activity &a) { return a.title == title; });
+        if (!taken) return title;
+        title = base + L" (" + std::to_wstring(n) + L")";
+    }
+}
+
+/** The CLI's error line without its "scriptorium: " prefix and usage hint. */
+std::wstring cliError(const RunResult &r) {
+    std::wstring err = wide(r.err);
+    size_t i = err.rfind(L"scriptorium: ");
+    if (i != std::wstring::npos) err = err.substr(i + 13);
+    if (size_t hint = err.find(L"\nRun \"scriptorium help\""); hint != std::wstring::npos) err = err.substr(0, hint);
+    while (!err.empty() && (err.back() == L'\n' || err.back() == L'\r')) err.pop_back();
+    if (err.empty()) err = L"녹음을 시작하지 못했어요 (종료 코드 " + std::to_wstring(r.exitCode) + L")";
+    return err;
+}
+
+void startRecording() {
+    if (form.starting) return;
+    if (!cliReady()) {
+        setFormStatus(L"Scriptorium 명령줄 도구를 찾지 못했어요: " + (fileExists(g.paths.node) ? g.paths.cli : g.paths.node), true);
+        return;
+    }
+    std::wstring title = windowText(form.title);
+    if (title.empty()) title = defaultTitle();
+    int source = std::max(0, (int)SendMessageW(form.source, CB_GETCURSEL, 0, 0));
+    int micSel = std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0));
+    std::wstring micId = micSel < (int)form.micIds.size() ? form.micIds[micSel] : L"default";
+    int langSel = std::clamp((int)SendMessageW(form.lang, CB_GETCURSEL, 0, 0), 0, (int)std::size(kLanguages) - 1);
+    std::wstring folder = windowText(form.folder);
+    bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
+    std::wstring speakers = advanced ? windowText(form.speakers) : L"";
+    std::wstring duration = advanced ? windowText(form.duration) : L"";
+    std::wstring prompt = advanced ? windowText(form.prompt) : L"";
+    if (!speakers.empty() && _wtoi(speakers.c_str()) < 1) {
+        setFormStatus(L"화자 수는 1 이상의 숫자로 적어 주세요.", true);
+        return;
+    }
+
+    std::vector<std::wstring> args = {g.paths.node, g.paths.cli, L"record", L"--detach", L"--data-dir", g.paths.dataDir,
+                                      L"--title", title, L"--lang", kLanguages[langSel][0]};
+    if (!folder.empty()) args.insert(args.end(), {L"--folder", folder});
+    if (source == 1) args.insert(args.end(), {L"--mic", L"none"});
+    else args.insert(args.end(), {L"--mic", micId});
+    if (source == 2) args.push_back(L"--no-system");
+    if (!speakers.empty()) args.insert(args.end(), {L"--speakers", speakers});
+    if (!duration.empty()) args.insert(args.end(), {L"--duration", duration});
+    if (!prompt.empty()) args.insert(args.end(), {L"--prompt", prompt});
+
+    form.settings = {source, micId, kLanguages[langSel][0], folder, advanced};
+    saveSettings();
+    form.starting = true;
+    updateFormEnabled();
+    setFormStatus(L"녹음을 준비하는 중… (음성 인식 모델을 불러오느라 몇 초 걸려요)", false);
+
+    HWND wnd = g.wnd;
+    std::thread([wnd, args, title] {
+        auto *res = new StartResult();
+        res->title = title;
+        // `record --detach` returns once the recorder runs (it waits up to 90 s for that)
+        RunResult r = runAndCapture(args, 120000);
+        res->ok = r.started && r.exitCode == 0;
+        if (!r.started) res->message = L"node.exe를 실행하지 못했어요";
+        else if (!res->ok) res->message = cliError(r);
+        if (!PostMessageW(wnd, WM_START_DONE, 0, reinterpret_cast<LPARAM>(res))) delete res;
+    }).detach();
+}
+
+void onStartDone(std::unique_ptr<StartResult> res) {
+    form.starting = false;
+    updateFormEnabled();
+    if (res->ok) {
+        SetWindowTextW(form.title, L"");  // the next recording gets its own title
+        setFormStatus(L"'" + res->title + L"' 녹음을 시작했어요", false);
+        SetTimer(g.wnd, TIMER_CLEAR_STATUS, 6000, nullptr);
+    } else {
+        setFormStatus(res->message, true);
+    }
+    poll();
 }
 
 // ---- reading the run folder ------------------------------------------------------------
@@ -577,12 +957,12 @@ std::vector<Finished> scanRunDir() {
                 std::string text = readFile(file, &ok);
                 Json j;
                 if (ok && !stale && parseJson(text, j) && j.type == Json::Object) {
-                    Finished f;
-                    f.recording = j.text(L"kind") == L"recording";
-                    f.ok = j.flag(L"ok");
-                    f.title = j.text(L"title");
-                    f.error = j.text(L"error");
-                    finished.push_back(std::move(f));
+                    Finished fin;
+                    fin.recording = j.text(L"kind") == L"recording";
+                    fin.ok = j.flag(L"ok");
+                    fin.title = j.text(L"title");
+                    fin.error = j.text(L"error");
+                    finished.push_back(std::move(fin));
                 }
                 if (ok) DeleteFileW(file.c_str());
             }
@@ -601,15 +981,15 @@ std::vector<Finished> scanRunDir() {
 void announce(const std::vector<Finished> &finished) {
     if (finished.empty()) return;
     if (finished.size() == 1) {
-        const Finished &f = finished[0];
-        std::wstring what = f.recording ? L"녹음" : L"파일 전사";
-        if (f.ok) notify(what + L" 완료", f.title + L" — 노트에 저장했어요");
-        else notify(what + L" 실패", f.title + (f.error.empty() ? L"" : L": " + f.error), true);
+        const Finished &fin = finished[0];
+        std::wstring what = fin.recording ? L"녹음" : L"파일 전사";
+        if (fin.ok) notify(what + L" 완료", fin.title + L" — 노트에 저장했어요");
+        else notify(what + L" 실패", fin.title + (fin.error.empty() ? L"" : L": " + fin.error), true);
         return;
     }
-    int failed = (int)std::count_if(finished.begin(), finished.end(), [](const Finished &f) { return !f.ok; });
+    int failed = (int)std::count_if(finished.begin(), finished.end(), [](const Finished &x) { return !x.ok; });
     std::wstring text;
-    for (const Finished &f : finished) text += (text.empty() ? L"" : L", ") + f.title + (f.ok ? L"" : L" (실패)");
+    for (const Finished &fin : finished) text += (text.empty() ? L"" : L", ") + fin.title + (fin.ok ? L"" : L" (실패)");
     notify(std::to_wstring(finished.size()) + L"개 작업이 끝났어요" + (failed ? L" · 실패 " + std::to_wstring(failed) + L"개" : L""),
            text, failed > 0);
 }
@@ -724,7 +1104,7 @@ void showMenu(POINT pt) {
     DestroyMenu(menu);
 }
 
-void onCommand(UINT id) {
+void onCommand(UINT id, UINT code) {
     if (id >= ID_STOP_FIRST && id < ID_STOP_FIRST + g.menuStopKeys.size()) {
         stopRecording(g.menuStopKeys[id - ID_STOP_FIRST]);
         poll();
@@ -738,6 +1118,16 @@ void onCommand(UINT id) {
     }
     switch (id) {
     case IDCANCEL: ShowWindow(g.wnd, SW_HIDE); break;  // Esc
+    case IDOK:  // Enter
+    case ID_START:
+        if (code == BN_CLICKED) startRecording();
+        break;
+    case ID_SOURCE:
+        if (code == CBN_SELCHANGE) updateFormEnabled();
+        break;
+    case ID_ADVANCED:
+        if (code == BN_CLICKED) fitWindow();
+        break;
     case ID_SHOW: showWindow(); break;
     case ID_OPEN_DATA: openDataFolder(); break;
     case ID_STOP_ALL:
@@ -805,7 +1195,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_COMMAND:
-        onCommand(LOWORD(wp));
+        onCommand(LOWORD(wp), HIWORD(wp));
         return 0;
     case WM_TIMER:
         if (wp == TIMER_PROBE) {
@@ -814,6 +1204,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(hwnd);
         } else if (wp == TIMER_POLL) {
             poll();
+        } else if (wp == TIMER_CLEAR_STATUS) {
+            KillTimer(hwnd, TIMER_CLEAR_STATUS);
+            if (!form.starting && !form.statusError) setFormStatus(L"", false);
         }
         return 0;
     case WM_CTLCOLORSTATIC: {
@@ -823,6 +1216,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkColor(dc, GetSysColor(COLOR_WINDOW));
         COLORREF color = GetSysColor(COLOR_WINDOWTEXT);
         if (id == ID_EMPTY) color = GetSysColor(COLOR_GRAYTEXT);
+        else if (id == ID_FORM_STATUS) color = form.statusError ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
         else if (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 1) {
             size_t row = (id - ID_ROW_FIRST) / kRowIds;
             color = row < g.rows.size() && g.rows[row].warn ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
@@ -839,12 +1233,18 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ensureFonts();
         for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
             UINT id = (UINT)GetDlgCtrlID(c);
-            bool bold = id == ID_RUNNING_HEADER || (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 0);
+            bool bold = id == ID_RUNNING_HEADER || id == ID_NEW_HEADER || (id >= ID_ROW_FIRST && (id - ID_ROW_FIRST) % kRowIds == 0);
             SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(bold ? g.boldFont : g.font), TRUE);
         }
         fitWindow();
         return 0;
     }
+    case WM_LISTS_LOADED:
+        applyLists(std::unique_ptr<Lists>(reinterpret_cast<Lists *>(lp)));
+        return 0;
+    case WM_START_DONE:
+        onStartDone(std::unique_ptr<StartResult>(reinterpret_cast<StartResult *>(lp)));
+        return 0;
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);  // closing hides; "종료" in the tray menu exits
         return 0;
@@ -919,7 +1319,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // WS_EX_TOOLWINDOW keeps the window off the taskbar; the tray icon is the way in.
     // WS_EX_CONTROLPARENT lets Tab move between the buttons and fields.
     g.wnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, wc.lpszClassName, L"Scriptorium",
-                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 340,
+                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, kClientWidth,
                             300, nullptr, nullptr, inst, nullptr);
     if (!g.wnd) return 1;
     // Lets Explorer's TaskbarCreated broadcast through UIPI if we ever run elevated.
@@ -927,7 +1327,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ChangeWindowMessageFilterEx(g.wnd, g.showMessage, MSGFLT_ALLOW, nullptr);
 
     addTrayIcon();
+    loadSettings();
+    createForm();
     poll();  // builds the window's content and sizes it
+    if (!g.probe) requestLists();
     SetTimer(g.wnd, TIMER_POLL, 1000, nullptr);
     if (g.probe) SetTimer(g.wnd, TIMER_PROBE, 3000, nullptr);
     else if (g.resident) showWindow();
