@@ -50,13 +50,14 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 enum MenuId : UINT {
     ID_SHOW = 100,
     ID_OPEN_DATA,
+    ID_OPEN_OUTPUT,
     ID_AUTOSTART,
     ID_STOP_ALL,
     ID_EXIT,
     ID_STOP_FIRST = 1000,  // + index into the menu's snapshot of recordings
-    ID_ROW_FIRST = 10000,  // window rows: + row * kRowIds + {title, status, stop}; above every other id
+    ID_ROW_FIRST = 10000,  // window rows: + row * kRowIds + RowPart; above every other id
 };
-constexpr UINT kRowIds = 4;
+constexpr UINT kRowIds = 6;
 constexpr UINT ID_EMPTY = 1900;
 constexpr UINT ID_RUNNING_HEADER = 1901;
 // the new-recording form
@@ -64,7 +65,6 @@ enum FormId : UINT {
     ID_NEW_HEADER = 3000,
     ID_LABEL,  // all field labels share it
     ID_TITLE,
-    ID_FOLDER,
     ID_SOURCE,
     ID_MIC,
     ID_LANG,
@@ -92,8 +92,24 @@ struct Paths {
     std::wstring cli;      // bin\scriptorium.js
     std::wstring dataDir;  // notes, recordings, run\ (same rule as src/env.js)
     std::wstring runDir;
+    std::wstring outputDir;  // recordings and their transcripts (same rule as src/output.js)
     bool packaged = false;
 };
+
+/**
+ * The user's Documents folder as Explorer has it (it may have been moved, e.g. to OneDrive), read
+ * from the same registry value src/output.js reads.
+ */
+std::wstring documentsDir() {
+    wchar_t buf[MAX_PATH * 4];
+    DWORD size = sizeof buf;
+    // RRF_RT_REG_EXPAND_SZ values are expanded (%USERPROFILE%\...) by RegGetValueW
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+                     L"Personal", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, buf, &size) == ERROR_SUCCESS &&
+        buf[0])
+        return buf;
+    return joinPath(envVar(L"USERPROFILE"), L"Documents");
+}
 
 std::wstring findOnPath(const wchar_t *exe) {
     wchar_t buf[MAX_PATH * 4];
@@ -146,6 +162,8 @@ Paths resolvePaths(const std::wstring &dataDirArg) {
     else if (std::wstring home = envVar(L"SCRIPTORIUM_HOME"); !home.empty()) p.dataDir = fullPath(home);
     else p.dataDir = joinPath(envVar(L"USERPROFILE"), L".scriptorium");
     p.runDir = joinPath(p.dataDir, L"run");
+    if (std::wstring out = envVar(L"SCRIPTORIUM_OUTPUT"); !out.empty()) p.outputDir = fullPath(out);
+    else p.outputDir = joinPath(documentsDir(), L"Scriptorium");
     return p;
 }
 
@@ -176,14 +194,14 @@ ULONGLONG fileTimeEpochMs(const FILETIME &ft) {
     return u.QuadPart > 116444736000000000ULL ? (u.QuadPart - 116444736000000000ULL) / 10000 : 0;
 }
 
-/** 75 -> "1:15", 3725 -> "1:02:05" */
-std::wstring clockText(long long seconds) {
+/** 75 -> "1:15", 3725 -> "1:02:05"; with padMinutes 75 -> "01:15" (a recording's clock) */
+std::wstring clockText(long long seconds, bool padMinutes = false) {
     if (seconds < 0) seconds = 0;
     wchar_t buf[32];
     if (seconds >= 3600)
         swprintf_s(buf, L"%lld:%02lld:%02lld", seconds / 3600, (seconds / 60) % 60, seconds % 60);
     else
-        swprintf_s(buf, L"%lld:%02lld", seconds / 60, seconds % 60);
+        swprintf_s(buf, padMinutes ? L"%02lld:%02lld" : L"%lld:%02lld", seconds / 60, seconds % 60);
     return buf;
 }
 
@@ -201,6 +219,19 @@ struct Activity {
     int index = 0, count = 1;                   // transcribe: which file of how many
     bool micMuted = false, micSilent = false;   // recording
     bool stopRequested = false;                 // a .stop file is waiting for the recorder
+    bool paused = false;                        // recording: paused (it follows its .pause file)
+    ULONGLONG pausedAtMs = 0;                   // recording: when the current pause began
+    double pausedMs = 0;                        // recording: earlier pauses, in total
+    bool pauseRequested = false;                // a .pause file exists (the recorder follows within 250 ms)
+    std::wstring lastText;                      // recording: the latest transcribed sentence
+
+    /** Seconds recorded so far: paused time is not recorded, so it does not count. */
+    long long recordedSeconds() const {
+        if (!startedMs) return 0;
+        ULONGLONG now = nowEpochMs();
+        double off = pausedMs + (paused && pausedAtMs && now > pausedAtMs ? (double)(now - pausedAtMs) : 0.0);
+        return std::max<long long>(0, (long long)(((double)(now - startedMs) - off) / 1000));
+    }
 
     bool live() const { return recording && phase != L"finishing"; }
 };
@@ -210,7 +241,7 @@ struct Activity {
 enum class TrayState { Idle, Recording, Working };
 
 struct Row {
-    HWND title = nullptr, status = nullptr, stop = nullptr;
+    HWND title = nullptr, status = nullptr, stop = nullptr, pause = nullptr, text = nullptr;
     bool warn = false;
 };
 
@@ -253,7 +284,7 @@ int S(int px) { return scaled(px, windowDpi()); }
 
 bool busy() { return !g.activities.empty(); }
 
-enum RowPart { ROW_TITLE = 0, ROW_STATUS = 1, ROW_STOP = 2 };
+enum RowPart { ROW_TITLE = 0, ROW_STATUS = 1, ROW_STOP = 2, ROW_PAUSE = 3, ROW_TEXT = 4 };
 
 /** Which part of a window row a control id is (ROW_*), with the row; -1 for any other control. */
 int rowPart(UINT id, size_t *row) {
@@ -437,11 +468,12 @@ void setTextIfChanged(HWND h, const std::wstring &text) {
 
 std::wstring statusText(const Activity &a, bool *warn) {
     *warn = false;
-    long long elapsed = a.startedMs ? (long long)(nowEpochMs() - a.startedMs) / 1000 : 0;
     if (a.recording) {
         if (a.phase == L"finishing") return L"녹음 끝 · 전사 마무리 중…";
-        std::wstring s = L"녹음 중 " + clockText(elapsed);
-        if (a.stopRequested) return s + L" · 정지하는 중…";
+        std::wstring clock = clockText(a.recordedSeconds(), true);
+        if (a.stopRequested) return L"녹음 " + clock + L" · 정지하는 중…";
+        if (a.paused) return L"일시 정지됨 " + clock;
+        std::wstring s = L"녹음 중 " + clock;
         if (a.micMuted) {
             *warn = true;
             return s + L" · 마이크가 음소거돼 있어요";
@@ -482,13 +514,22 @@ int layout() {
         if (g.emptyLabel) SetWindowPos(g.emptyLabel, nullptr, m, y, w, S(20), SWP_NOZORDER);
         y += S(26);
     }
-    const int stopW = S(56), stopH = S(26), lineH = S(19);
+    const int stopW = S(52), pauseW = S(72), btnH = S(26), lineH = S(19), btnGap = S(6);
     for (const Row &r : g.rows) {
-        int textW = r.stop ? w - stopW - S(8) : w;
+        int buttonsW = (r.stop ? stopW : 0) + (r.pause ? pauseW + btnGap : 0);
+        int textW = buttonsW ? w - buttonsW - S(8) : w;
         SetWindowPos(r.title, nullptr, m, y, textW, lineH, SWP_NOZORDER);
         SetWindowPos(r.status, nullptr, m, y + lineH, textW, lineH, SWP_NOZORDER);
-        if (r.stop) SetWindowPos(r.stop, nullptr, m + w - stopW, y + (2 * lineH - stopH) / 2, stopW, stopH, SWP_NOZORDER);
-        y += 2 * lineH + S(10);
+        int btnY = y + (2 * lineH - btnH) / 2;
+        if (r.stop) SetWindowPos(r.stop, nullptr, m + w - stopW, btnY, stopW, btnH, SWP_NOZORDER);
+        if (r.pause) SetWindowPos(r.pause, nullptr, m + w - stopW - btnGap - pauseW, btnY, pauseW, btnH, SWP_NOZORDER);
+        y += 2 * lineH;
+        if (r.text) {
+            // the latest transcribed sentence, across the whole width under the buttons
+            SetWindowPos(r.text, nullptr, m, y + S(3), w, lineH, SWP_NOZORDER);
+            y += lineH + S(3);
+        }
+        y += S(10);
     }
     if (!g.rows.empty()) y -= S(4);
     return layoutForm(m, y + S(6), w) + m;
@@ -523,6 +564,7 @@ void fitWindow() {
 void refreshRows() {
     ensureFonts();
     std::wstring shape;
+    // a live recording has 일시 정지/정지 buttons and a line for its latest sentence
     for (const Activity &a : g.activities) shape += a.key + (a.live() && !a.stopRequested ? L"|s;" : L"|;");
     if (!g.runningHeader) {
         g.runningHeader = makeChild(L"STATIC", L"진행 중", SS_LEFT | SS_NOPREFIX, ID_RUNNING_HEADER, g.boldFont);
@@ -531,11 +573,10 @@ void refreshRows() {
     if (shape != g.rowsShape) {
         HWND focus = GetFocus();
         bool rowHadFocus = false;
-        for (const Row &r : g.rows) rowHadFocus |= focus && (focus == r.stop || focus == r.title || focus == r.status);
+        for (const Row &r : g.rows) rowHadFocus |= focus && (focus == r.stop || focus == r.pause);
         for (Row &r : g.rows) {
-            DestroyWindow(r.title);
-            DestroyWindow(r.status);
-            if (r.stop) DestroyWindow(r.stop);
+            for (HWND h : {r.title, r.status, r.stop, r.pause, r.text})
+                if (h) DestroyWindow(h);
         }
         g.rows.clear();
         for (size_t i = 0; i < g.activities.size(); i++) {
@@ -544,8 +585,11 @@ void refreshRows() {
             Row r;
             r.title = makeChild(L"STATIC", a.title.c_str(), SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, base, g.boldFont);
             r.status = makeChild(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, base + 1, g.font);
-            if (a.live() && !a.stopRequested)
-                r.stop = makeChild(L"BUTTON", L"정지", BS_PUSHBUTTON | WS_TABSTOP, base + 2, g.font);
+            if (a.live() && !a.stopRequested) {
+                r.pause = makeChild(L"BUTTON", L"일시 정지", BS_PUSHBUTTON | WS_TABSTOP, base + ROW_PAUSE, g.font);
+                r.stop = makeChild(L"BUTTON", L"정지", BS_PUSHBUTTON | WS_TABSTOP, base + ROW_STOP, g.font);
+                r.text = makeChild(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, base + ROW_TEXT, g.font);
+            }
             g.rows.push_back(r);
         }
         ShowWindow(g.emptyLabel, g.rows.empty() ? SW_SHOW : SW_HIDE);
@@ -557,6 +601,10 @@ void refreshRows() {
         bool warn = false;
         setTextIfChanged(g.rows[i].title, g.activities[i].title.empty() ? L"(제목 없음)" : g.activities[i].title);
         setTextIfChanged(g.rows[i].status, statusText(g.activities[i], &warn));
+        const Activity &a = g.activities[i];
+        if (g.rows[i].pause) setTextIfChanged(g.rows[i].pause, a.pauseRequested ? L"재개" : L"일시 정지");
+        if (g.rows[i].text)
+            setTextIfChanged(g.rows[i].text, a.lastText.empty() ? L"전사된 문장이 여기에 나와요" : L"“" + a.lastText + L"”");
         if (warn != g.rows[i].warn) {
             g.rows[i].warn = warn;
             InvalidateRect(g.rows[i].status, nullptr, TRUE);
@@ -582,7 +630,7 @@ void showWindow() {
     // the launcher's STARTUPINFO show state, which started the window minimized in testing.
     if (!IsWindowVisible(g.wnd)) {
         placeNearTray();
-        requestLists();  // microphones and folders may have changed while it was hidden
+        requestLists();  // microphones may have changed while it was hidden
     }
     ShowWindow(g.wnd, SW_SHOW);
     if (IsIconic(g.wnd)) ShowWindow(g.wnd, SW_RESTORE);
@@ -595,6 +643,12 @@ void openDataFolder() {
     ShellExecuteW(g.wnd, L"open", g.paths.dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+/** Documents\Scriptorium: the recordings (<title>.wav) and their transcripts (<title>.txt). */
+void openOutputFolder() {
+    makeDirs(g.paths.outputDir);
+    ShellExecuteW(g.wnd, L"open", g.paths.outputDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 // ---- new-recording form -----------------------------------------------------------------
 
 /** What the user picked last time, kept in <data>\gui.json. */
@@ -602,14 +656,13 @@ struct Settings {
     int source = 0;  // 0 microphone + computer audio, 1 computer audio only, 2 microphone only
     std::wstring mic = L"default";
     std::wstring lang = L"ko";
-    std::wstring folder;
     bool advanced = false;
 };
 
 struct Form {
     HWND header = nullptr;
-    std::vector<HWND> labels;  // 제목, 폴더, 소리, 마이크, 언어, 화자 수, 시간 제한, 단어 힌트
-    HWND title = nullptr, folder = nullptr, source = nullptr, mic = nullptr, lang = nullptr;
+    std::vector<HWND> labels;  // 제목, 소리, 마이크, 언어, 화자 수, 시간 제한, 단어 힌트
+    HWND title = nullptr, source = nullptr, mic = nullptr, lang = nullptr;
     HWND advanced = nullptr, speakers = nullptr, duration = nullptr, prompt = nullptr;
     HWND start = nullptr, status = nullptr;
     bool statusError = false;
@@ -650,15 +703,13 @@ void loadSettings() {
     s.source = std::clamp((int)j.number(L"source", 0), 0, 2);
     s.mic = j.text(L"mic", L"default");
     s.lang = j.text(L"lang", L"ko");
-    s.folder = j.text(L"folder");
     s.advanced = j.flag(L"advanced");
 }
 
 void saveSettings() {
     const Settings &s = form.settings;
     std::string json = "{\"source\":" + std::to_string(s.source) + ",\"mic\":" + jsonString(s.mic) +
-                       ",\"lang\":" + jsonString(s.lang) + ",\"folder\":" + jsonString(s.folder) +
-                       ",\"advanced\":" + (s.advanced ? "true" : "false") + "}\n";
+                       ",\"lang\":" + jsonString(s.lang) + ",\"advanced\":" + (s.advanced ? "true" : "false") + "}\n";
     makeDirs(g.paths.dataDir);
     writeFileAtomic(settingsPath(), json);
 }
@@ -696,10 +747,6 @@ void createForm() {
     form.header = makeChild(L"STATIC", L"새 녹음", SS_LEFT | SS_NOPREFIX, ID_NEW_HEADER, g.boldFont);
     label(L"제목");
     form.title = edit(ID_TITLE, L"비워두면 날짜와 시간");
-    label(L"폴더");
-    form.folder = combo(ID_FOLDER, CBS_DROPDOWN | CBS_AUTOHSCROLL);
-    if (HWND inner = FindWindowExW(form.folder, nullptr, L"Edit", nullptr))
-        SendMessageW(inner, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"폴더 없음 (새 이름이면 만들어요)"));
     label(L"소리");
     form.source = combo(ID_SOURCE, CBS_DROPDOWNLIST);
     for (const wchar_t *s : kSources) SendMessageW(form.source, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
@@ -727,7 +774,6 @@ void createForm() {
     for (int i = 0; i < (int)std::size(kLanguages); i++)
         if (s.lang == kLanguages[i][0]) lang = i;
     SendMessageW(form.lang, CB_SETCURSEL, lang, 0);
-    SetWindowTextW(form.folder, s.folder.c_str());
     Button_SetCheck(form.advanced, s.advanced ? BST_CHECKED : BST_UNCHECKED);
     updateFormEnabled();
 }
@@ -738,8 +784,9 @@ int layoutForm(int m, int y, int w) {
     SetWindowPos(form.header, nullptr, m, y, w, S(20), SWP_NOZORDER);
     y += S(26);
     bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
-    HWND fields[] = {form.title, form.folder, form.source, form.mic, form.lang};
-    for (int i = 0; i < 5; i++) {
+    HWND fields[] = {form.title, form.source, form.mic, form.lang};
+    constexpr int kFields = (int)std::size(fields);
+    for (int i = 0; i < kFields; i++) {
         SetWindowPos(form.labels[i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
         // a combo box's height includes its drop-down list
         bool isCombo = fields[i] != form.title;
@@ -750,10 +797,10 @@ int layoutForm(int m, int y, int w) {
     y += S(22) + gap;
     HWND extra[] = {form.speakers, form.duration, form.prompt};
     for (int i = 0; i < 3; i++) {
-        ShowWindow(form.labels[5 + i], advanced ? SW_SHOW : SW_HIDE);
+        ShowWindow(form.labels[kFields + i], advanced ? SW_SHOW : SW_HIDE);
         ShowWindow(extra[i], advanced ? SW_SHOW : SW_HIDE);
         if (!advanced) continue;
-        SetWindowPos(form.labels[5 + i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
+        SetWindowPos(form.labels[kFields + i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
         SetWindowPos(extra[i], nullptr, fieldX, y, i == 0 ? S(80) : fieldW, rowH, SWP_NOZORDER);
         y += rowH + gap;
     }
@@ -780,13 +827,12 @@ int layoutForm(int m, int y, int w) {
     return y;
 }
 
-// -- device and folder lists, loaded off the UI thread through the CLI --
+// -- the microphone list, loaded off the UI thread through the CLI --
 
 struct Lists {
-    bool devicesOk = false, foldersOk = false;
+    bool devicesOk = false;
     std::vector<std::pair<std::wstring, std::wstring>> mics;  // id, label
     std::wstring defaultMic;
-    std::vector<std::wstring> folders;
 };
 
 std::vector<std::wstring> cliArgs(std::initializer_list<std::wstring> rest) {
@@ -802,9 +848,9 @@ bool cliReady() { return fileExists(g.paths.node) && fileExists(g.paths.cli); }
 void requestLists() {
     if (form.listsLoading || !cliReady()) return;
     form.listsLoading = true;
-    std::vector<std::wstring> devices = cliArgs({L"devices"}), folders = cliArgs({L"folders", L"list"});
+    std::vector<std::wstring> devices = cliArgs({L"devices"});
     HWND wnd = g.wnd;
-    std::thread([wnd, devices, folders] {
+    std::thread([wnd, devices] {
         auto *lists = new Lists();
         RunResult d = runAndCapture(devices, 30000);
         Json j;
@@ -818,12 +864,6 @@ void requestLists() {
                     lists->mics.emplace_back(dev.text(L"id"), name + (dev.flag(L"muted") ? L" (음소거됨)" : L""));
                 }
             }
-        }
-        RunResult fo = runAndCapture(folders, 30000);
-        Json k;
-        if (fo.exitCode == 0 && parseJson(fo.out, k) && k.type == Json::Array) {
-            lists->foldersOk = true;
-            for (const Json &folder : k.arr) lists->folders.push_back(folder.text(L"name"));
         }
         if (!PostMessageW(wnd, WM_LISTS_LOADED, 0, reinterpret_cast<LPARAM>(lists))) delete lists;
     }).detach();
@@ -848,34 +888,19 @@ void applyLists(std::unique_ptr<Lists> lists) {
         }
         SendMessageW(form.mic, CB_SETCURSEL, sel, 0);
     }
-    if (lists->foldersOk) {
-        std::wstring text = windowText(form.folder);
-        SendMessageW(form.folder, CB_RESETCONTENT, 0, 0);
-        for (const auto &name : lists->folders) SendMessageW(form.folder, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
-        SetWindowTextW(form.folder, text.c_str());
-    }
 }
 
 // -- starting a recording --
 
+constexpr DWORD kNameTakenExit = 3;  // `record` exit code when <title>.wav/.txt exists (src/output.js)
+
 struct StartResult {
     bool ok = false;
+    bool overwrite = false;   // this attempt was told to replace existing files
+    bool nameTaken = false;   // exit code 3
+    bool nameRecording = false;  // ...because a running recording uses the name (no overwriting that)
     std::wstring title, typed, message;
 };
-
-/** "Recording 2026-11-18 14:30", like the CLI's default, plus " (2)" if that title is already running. */
-std::wstring defaultTitle() {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t buf[64];
-    swprintf_s(buf, L"Recording %04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
-    std::wstring base = buf, title = base;
-    for (int n = 2;; n++) {
-        bool taken = std::any_of(g.activities.begin(), g.activities.end(), [&](const Activity &a) { return a.title == title; });
-        if (!taken) return title;
-        title = base + L" (" + std::to_wstring(n) + L")";
-    }
-}
 
 /** The CLI's error line without its "scriptorium: " prefix and usage hint. */
 std::wstring cliError(const RunResult &r) {
@@ -888,7 +913,12 @@ std::wstring cliError(const RunResult &r) {
     return err;
 }
 
-void startRecording() {
+/**
+ * Starts `record --detach` with the form's choices. Without a typed title the CLI names the
+ * recording after its start time (and picks a free name). With overwrite, existing
+ * <title>.wav/.txt files are replaced; that is only passed after the user agreed to it.
+ */
+void startRecording(bool overwrite = false) {
     if (form.starting) return;
     if (!cliReady()) {
         std::wstring what = !fileExists(g.paths.node) ? (g.paths.node.empty() ? L"node.exe (PATH에 없음)" : g.paths.node)
@@ -897,13 +927,11 @@ void startRecording() {
         return;
     }
     std::wstring typed = windowText(form.title);
-    std::wstring title = typed.empty() ? defaultTitle() : typed;
     int source = std::max(0, (int)SendMessageW(form.source, CB_GETCURSEL, 0, 0));
     int micSel = std::max(0, (int)SendMessageW(form.mic, CB_GETCURSEL, 0, 0));
     std::wstring micId = micSel < (int)form.micIds.size() ? form.micIds[micSel] : L"default";
     if (!form.listsLoaded) micId = form.settings.mic;  // the list (with the saved choice) has not arrived yet
     int langSel = std::clamp((int)SendMessageW(form.lang, CB_GETCURSEL, 0, 0), 0, (int)std::size(kLanguages) - 1);
-    std::wstring folder = windowText(form.folder);
     bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
     std::wstring speakers = advanced ? windowText(form.speakers) : L"";
     std::wstring duration = advanced ? windowText(form.duration) : L"";
@@ -914,8 +942,9 @@ void startRecording() {
     }
 
     std::vector<std::wstring> args = {g.paths.node, g.paths.cli, L"record", L"--detach", L"--data-dir", g.paths.dataDir,
-                                      L"--title", title, L"--lang", kLanguages[langSel][0]};
-    if (!folder.empty()) args.insert(args.end(), {L"--folder", folder});
+                                      L"--lang", kLanguages[langSel][0]};
+    if (!typed.empty()) args.insert(args.end(), {L"--title", typed});
+    if (overwrite) args.push_back(L"--overwrite");
     if (source == 1) args.insert(args.end(), {L"--mic", L"none"});
     else args.insert(args.end(), {L"--mic", micId});
     if (source == 2) args.push_back(L"--no-system");
@@ -923,24 +952,39 @@ void startRecording() {
     if (!duration.empty()) args.insert(args.end(), {L"--duration", duration});
     if (!prompt.empty()) args.insert(args.end(), {L"--prompt", prompt});
 
-    form.settings = {source, micId, kLanguages[langSel][0], folder, advanced};
+    form.settings = {source, micId, kLanguages[langSel][0], advanced};
     saveSettings();
     form.starting = true;
     updateFormEnabled();
     setFormStatus(L"녹음을 준비하는 중… (음성 인식 모델을 불러오느라 몇 초 걸려요)", false);
 
     HWND wnd = g.wnd;
-    std::thread([wnd, args, title, typed] {
+    std::thread([wnd, args, typed, overwrite] {
         auto *res = new StartResult();
-        res->title = title;
+        res->title = typed;
         res->typed = typed;
+        res->overwrite = overwrite;
         // `record --detach` returns once the recorder runs (it waits up to 90 s for that)
         RunResult r = runAndCapture(args, 120000);
         res->ok = r.started && r.exitCode == 0;
         if (!r.started) res->message = L"node.exe를 실행하지 못했어요";
-        else if (!res->ok) res->message = cliError(r);
+        else if (!res->ok) {
+            res->message = cliError(r);
+            res->nameTaken = r.exitCode == kNameTakenExit;
+            res->nameRecording = res->message.find(L"being recorded now") != std::wstring::npos;
+        } else if (Json j; parseJson(r.out, j) && j.type == Json::Object && !j.text(L"title").empty()) {
+            res->title = j.text(L"title");  // the CLI's title when none was typed
+        }
         if (!PostMessageW(wnd, WM_START_DONE, 0, reinterpret_cast<LPARAM>(res))) delete res;
     }).detach();
+}
+
+int modalBox(const std::wstring &text, UINT flags, const wchar_t *caption = L"Scriptorium");
+
+/** Puts the caret in the title field with its text selected, to type another name. */
+void focusTitle() {
+    SetFocus(form.title);
+    SendMessageW(form.title, EM_SETSEL, 0, -1);
 }
 
 void onStartDone(std::unique_ptr<StartResult> res) {
@@ -951,6 +995,20 @@ void onStartDone(std::unique_ptr<StartResult> res) {
         if (windowText(form.title) == res->typed) SetWindowTextW(form.title, L"");
         setFormStatus(L"'" + res->title + L"' 녹음을 시작했어요", false);
         SetTimer(g.wnd, TIMER_CLEAR_STATUS, 6000, nullptr);
+    } else if (res->nameTaken && res->nameRecording) {
+        setFormStatus(L"'" + res->typed + L"' 제목으로 녹음하고 있어요. 다른 제목을 적어 주세요.", true);
+        focusTitle();
+    } else if (res->nameTaken && !res->overwrite) {
+        setFormStatus(L"", false);
+        std::wstring text = L"'" + res->typed + L"' 녹음이 이미 있어요.\n\n" +
+                            L"덮어쓰면 이전 녹음 파일(.wav)과 전사본(.txt)이 새 녹음으로 바뀌어요.\n\n" +
+                            L"예: 덮어쓰고 녹음 시작\n아니요: 제목 바꾸기";
+        if (modalBox(text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) {
+            if (windowText(form.title) == res->typed) startRecording(true);
+            return;
+        }
+        setFormStatus(L"다른 제목을 적어 주세요.", true);
+        focusTitle();
     } else {
         setFormStatus(res->message, true);
     }
@@ -991,6 +1049,11 @@ bool readActivity(const std::wstring &file, const std::wstring &key, Activity &a
             a.micSilent = audio->flag(L"microphoneSilent");
         }
         a.stopRequested = fileExists(joinPath(g.paths.runDir, key + L".stop"));
+        a.pauseRequested = fileExists(joinPath(g.paths.runDir, key + L".pause"));
+        a.paused = j.flag(L"paused");
+        a.pausedAtMs = parseIsoMs(j.text(L"pausedAt"));
+        a.pausedMs = j.number(L"pausedMs");
+        a.lastText = j.text(L"lastText");
     } else {
         a.phase = j.text(L"phase", L"transcribing");
         a.totalSeconds = j.has(L"totalSeconds") ? j.number(L"totalSeconds") : -1;
@@ -1003,7 +1066,7 @@ bool readActivity(const std::wstring &file, const std::wstring &key, Activity &a
 
 struct Finished {
     bool recording = false, ok = false;
-    std::wstring title, error;
+    std::wstring title, error, textPath;
 };
 
 /** Scans <data>\run: running work into g.activities, and finished-*.json notices (which are consumed). */
@@ -1027,6 +1090,7 @@ std::vector<Finished> scanRunDir() {
                     if (!g.probe) {
                         DeleteFileW(file.c_str());
                         DeleteFileW(joinPath(g.paths.runDir, key + L".stop").c_str());
+                        DeleteFileW(joinPath(g.paths.runDir, key + L".pause").c_str());
                     }
                     continue;
                 }
@@ -1042,6 +1106,7 @@ std::vector<Finished> scanRunDir() {
                     fin.ok = j.flag(L"ok");
                     fin.title = j.text(L"title");
                     fin.error = j.text(L"error");
+                    fin.textPath = j.text(L"textPath");
                     finished.push_back(std::move(fin));
                 }
                 if (ok) DeleteFileW(file.c_str());
@@ -1063,7 +1128,14 @@ void announce(const std::vector<Finished> &finished) {
     if (finished.size() == 1) {
         const Finished &fin = finished[0];
         std::wstring what = fin.recording ? L"녹음" : L"파일 전사";
-        if (fin.ok) notify(what + L" 완료", fin.title + L" — 노트에 저장했어요");
+        if (fin.ok && !fin.textPath.empty()) {
+            // "알고리즘 1주차.txt" — the file is what the user goes looking for
+            size_t slash = fin.textPath.find_last_of(L"\\/");
+            std::wstring name = slash == std::wstring::npos ? fin.textPath : fin.textPath.substr(slash + 1);
+            notify(what + L" 완료", fin.title + L" — 전사본을 " + name + L"(으)로 저장했어요");
+        } else if (fin.ok) {
+            notify(what + L" 완료", fin.title + L" — 노트에 저장했어요");
+        }
         else notify(what + L" 실패", fin.title + (fin.error.empty() ? L"" : L": " + fin.error), true);
         return;
     }
@@ -1131,6 +1203,17 @@ void stopRecording(const std::wstring &key) {
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
 }
 
+/** Pauses or resumes a recording, the same way `scriptorium pause|resume` does: recording-<id>.pause. */
+void setRecordingPaused(const std::wstring &key, bool pause) {
+    std::wstring file = joinPath(g.paths.runDir, key + L".pause");
+    if (!pause) {
+        DeleteFileW(file.c_str());
+        return;
+    }
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+
 void stopAllRecordings() {
     for (const Activity &a : g.activities)
         if (a.live()) stopRecording(a.key);
@@ -1140,9 +1223,9 @@ void stopAllRecordings() {
  * "종료": quits at once when nothing runs. Otherwise the tray icon has to stay while work runs, so
  * it offers to stop the recordings and quit once everything has finished.
  */
-int modalBox(const std::wstring &text, UINT flags) {
+int modalBox(const std::wstring &text, UINT flags, const wchar_t *caption) {
     g.modal = true;
-    int r = MessageBoxW(g.wnd, text.c_str(), L"Scriptorium 종료", flags | MB_SETFOREGROUND);
+    int r = MessageBoxW(g.wnd, text.c_str(), caption, flags | MB_SETFOREGROUND);
     g.modal = false;
     return r;
 }
@@ -1150,7 +1233,7 @@ int modalBox(const std::wstring &text, UINT flags) {
 void requestExit() {
     if (form.starting) {
         // the recorder is about to start; quitting now would leave it running with no icon
-        modalBox(L"녹음을 시작하는 중이에요. 시작된 뒤에 다시 종료해 주세요.", MB_OK | MB_ICONINFORMATION);
+        modalBox(L"녹음을 시작하는 중이에요. 시작된 뒤에 다시 종료해 주세요.", MB_OK | MB_ICONINFORMATION, L"Scriptorium 종료");
         return;
     }
     if (!busy()) {
@@ -1168,7 +1251,7 @@ void requestExit() {
     if (live || finishing) waits = L"녹음 전사";
     if (files) waits += (waits.empty() ? L"" : L"와 ") + std::wstring(L"파일 전사 ") + std::to_wstring(files) + L"개";
     text += waits + L"가 모두 끝나면 Scriptorium을 종료할까요?\n\n그때까지는 트레이 아이콘이 남아 있어요.";
-    if (modalBox(text, MB_OKCANCEL | MB_ICONQUESTION) != IDOK || !IsWindow(g.wnd)) return;
+    if (modalBox(text, MB_OKCANCEL | MB_ICONQUESTION, L"Scriptorium 종료") != IDOK || !IsWindow(g.wnd)) return;
     stopAllRecordings();
     g.exitWhenIdle = true;
     ShowWindow(g.wnd, SW_HIDE);
@@ -1216,8 +1299,7 @@ void showMenu(POINT pt) {
     for (const Activity &a : g.activities) {
         if (!a.live() || a.stopRequested) continue;
         if (g.menuStopKeys.empty()) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        long long elapsed = a.startedMs ? (long long)(nowEpochMs() - a.startedMs) / 1000 : 0;
-        std::wstring label = L"정지: " + a.title + L" (" + clockText(elapsed) + L")";
+        std::wstring label = L"정지: " + a.title + L" (" + clockText(a.recordedSeconds(), true) + (a.paused ? L", 일시 정지됨)" : L")");
         // '&' would underline the next letter in a menu
         for (size_t i = 0; (i = label.find(L'&', i)) != std::wstring::npos; i += 2) label.insert(i, 1, L'&');
         AppendMenuW(menu, MF_STRING, ID_STOP_FIRST + (UINT)g.menuStopKeys.size(), label.c_str());
@@ -1225,6 +1307,7 @@ void showMenu(POINT pt) {
     }
     if (g.menuStopKeys.size() > 1) AppendMenuW(menu, MF_STRING, ID_STOP_ALL, L"녹음 모두 정지");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, ID_OPEN_OUTPUT, L"녹음 폴더 열기");
     AppendMenuW(menu, MF_STRING, ID_OPEN_DATA, L"데이터 폴더 열기");
     AppendMenuW(menu, MF_STRING | (autostartEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_AUTOSTART, L"Windows 시작 시 실행");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1249,6 +1332,14 @@ void onCommand(UINT id, UINT code) {
         poll();
         return;
     }
+    if (rowPart(id, &row) == ROW_PAUSE) {  // a row's 일시 정지 / 재개 button
+        if (row < g.activities.size() && g.activities[row].live()) {
+            const Activity &a = g.activities[row];
+            setRecordingPaused(a.key, !a.pauseRequested);
+        }
+        poll();
+        return;
+    }
     switch (id) {
     case IDCANCEL: ShowWindow(g.wnd, SW_HIDE); break;  // Esc
     case IDOK:  // Enter
@@ -1263,6 +1354,7 @@ void onCommand(UINT id, UINT code) {
         break;
     case ID_SHOW: showWindow(); break;
     case ID_OPEN_DATA: openDataFolder(); break;
+    case ID_OPEN_OUTPUT: openOutputFolder(); break;
     case ID_AUTOSTART: setAutostart(!autostartEnabled()); break;
     case ID_STOP_ALL:
         stopAllRecordings();
@@ -1307,13 +1399,15 @@ void writeProbe() {
     json += ",\"cli\":" + jsonString(p.cli);
     json += std::string(",\"cliFound\":") + (fileExists(p.cli) ? "true" : "false");
     json += ",\"dataDir\":" + jsonString(p.dataDir);
+    json += ",\"outputDir\":" + jsonString(p.outputDir);
     json += ",\"activities\":[";
     for (size_t i = 0; i < g.activities.size(); i++) {
         const Activity &a = g.activities[i];
         bool warn = false;
         json += (i ? "," : "");
         json += "{\"key\":" + jsonString(a.key) + ",\"title\":" + jsonString(a.title) + ",\"phase\":" + jsonString(a.phase) +
-                ",\"status\":" + jsonString(statusText(a, &warn)) + "}";
+                ",\"status\":" + jsonString(statusText(a, &warn)) + ",\"paused\":" + (a.paused ? "true" : "false") +
+                ",\"lastText\":" + jsonString(a.lastText) + "}";
     }
     json += "]}\n";
     writeFileAtomic(g.probeFile, json);
@@ -1376,6 +1470,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == ID_FORM_STATUS) color = form.statusError ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
         else if (size_t row = 0; rowPart(id, &row) == ROW_STATUS)
             color = g.rows[row].warn ? RGB(196, 43, 28) : GetSysColor(COLOR_GRAYTEXT);
+        else if (rowPart(id, &row) == ROW_TEXT)
+            color = GetSysColor(COLOR_GRAYTEXT);
         SetTextColor(dc, color);
         return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     }

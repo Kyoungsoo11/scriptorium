@@ -4,6 +4,7 @@
 //   recording-<id>.json            a live recording (also read by `status` and `stop`).
 //                                  phase "recording", then "finishing" once it was told to stop.
 //   recording-<id>.stop            asks that recording to stop (written by `stop` and the tray app)
+//   recording-<id>.pause           while it exists the recording is paused (`pause`/`resume`, tray app)
 //   transcribe-<pid>.json          a file transcription in progress, with progress in seconds
 //   finished-<kind>-<id>.json      one piece of work that ended (ok or not); the tray app shows a
 //                                  notice and deletes it. Notices older than a week are pruned.
@@ -56,7 +57,7 @@ function pruneOldNotices(runDir) {
 }
 
 /** Records that a recording or transcription ended. Never throws: the work itself is done. */
-function writeFinished(env, { kind, id, title, ok, noteId = null, error = null, audioPath = null }) {
+function writeFinished(env, { kind, id, title, ok, noteId = null, error = null, audioPath = null, textPath = null }) {
   try {
     const safeId = String(id).replace(/[^\w.-]/g, '_');
     writeJsonAtomic(path.join(env.runDir, `finished-${kind}-${safeId}.json`), {
@@ -67,6 +68,7 @@ function writeFinished(env, { kind, id, title, ok, noteId = null, error = null, 
       noteId,
       ...(error ? { error: String(error).slice(0, 500) } : {}),
       ...(audioPath ? { audioPath } : {}),
+      ...(textPath ? { textPath } : {}),
       endedAt: new Date().toISOString(),
     });
     // with no tray app running nothing consumes them
