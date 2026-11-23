@@ -4,7 +4,7 @@
 // and exits 0 on success, 1 on failure, 2 on bad usage, 3 when an output file name is taken.
 //
 // The commands live in src/commands/: transcribe, record (record/stop/pause/resume/status),
-// notes (notes/speakers), setup (app/devices/doctor); common holds what they share.
+// notes (notes/speakers), clean, setup (app/devices/doctor); common holds what they share.
 
 const { resolveEnv } = require('./env');
 const { UsageError } = require('./store');
@@ -13,6 +13,7 @@ const { printJson } = require('./commands/common');
 const { cmdTranscribe } = require('./commands/transcribe');
 const { cmdRecord, cmdStop, setPaused, recordingStatus } = require('./commands/record');
 const { cmdNotes, cmdSpeakers } = require('./commands/notes');
+const { cmdClean } = require('./commands/clean');
 const { withTrayApp, cmdApp, cmdDevices, cmdDoctor, VERSION } = require('./commands/setup');
 
 const GLOBAL_VALUES = ['data-dir', 'models-dir', 'whisper-model', 'native', 'log-file'];
@@ -39,6 +40,13 @@ Notes
   notes rename <noteId> <title>
   notes delete <noteId> [--keep-files]
   speakers rename <noteId> <SPEAKER_00> <name>   (also rewrites the note's .txt)
+
+Cleaning up
+  clean                            show what can be deleted, delete nothing
+  clean recordings                 delete the .wav files of recordings made up to 0.4 (<data>\\recordings)
+  clean run                        delete logs and other leftovers of finished work (<data>\\run)
+  clean all                        both; add --dry-run to any of these to only show
+    Work in progress is left alone, and so are notes, transcripts and Documents\\Scriptorium.
 
 App
   app                              open the Scriptorium tray app (start recordings, see what is running)
@@ -102,6 +110,7 @@ const COMMANDS = {
   status: {},
   notes: { values: ['search', 'limit', 'format', 'out', 'output-dir'], booleans: ['keep-files', 'keep-audio'] },
   speakers: {},
+  clean: { booleans: ['dry-run'] },
   app: {},
   devices: {},
   doctor: { values: ['output-dir'] },
@@ -155,6 +164,9 @@ async function main(argv = process.argv.slice(2)) {
         break;
       case 'speakers':
         cmdSpeakers(env, opts, positionals);
+        break;
+      case 'clean':
+        cmdClean(env, opts, positionals);
         break;
       case 'app':
         await cmdApp(env);

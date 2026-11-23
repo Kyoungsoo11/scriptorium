@@ -52,6 +52,9 @@ enum MenuId : UINT {
     ID_OPEN_DATA,
     ID_OPEN_OUTPUT,
     ID_AUTOSTART,
+    ID_CLEAN_RECORDINGS,
+    ID_CLEAN_RUN,
+    ID_CLEAN_ALL,
     ID_STOP_ALL,
     ID_EXIT,
     ID_STOP_FIRST = 1000,  // + index into the menu's snapshot of recordings
@@ -73,12 +76,14 @@ enum FormId : UINT {
     ID_DURATION,
     ID_PROMPT,
     ID_START,
+    ID_CLEAN,  // the 정리 button: opens the same choices as the tray menu's 정리
     ID_FORM_STATUS,
 };
 constexpr int kClientWidth = 360;  // at 96 DPI
 
 constexpr UINT WM_LISTS_LOADED = WM_APP + 2;  // lParam: Lists* from a worker thread
 constexpr UINT WM_START_DONE = WM_APP + 3;    // lParam: StartResult* from a worker thread
+constexpr UINT WM_CLEAN_DONE = WM_APP + 4;    // lParam: CleanResult* from a worker thread
 
 enum TimerId : UINT_PTR { TIMER_PROBE = 1, TIMER_POLL, TIMER_CLEAR_STATUS };
 constexpr ULONGLONG kIdleExitMs = 15000;           // background mode: linger so the last notice can be read
@@ -664,10 +669,11 @@ struct Form {
     std::vector<HWND> labels;  // 제목, 소리, 마이크, 언어, 화자 수, 시간 제한, 단어 힌트
     HWND title = nullptr, source = nullptr, mic = nullptr, lang = nullptr;
     HWND advanced = nullptr, speakers = nullptr, duration = nullptr, prompt = nullptr;
-    HWND start = nullptr, status = nullptr;
+    HWND start = nullptr, clean = nullptr, status = nullptr;
     bool statusError = false;
     std::vector<std::wstring> micIds;  // parallel to the mic combo's items
     bool starting = false;
+    bool cleaning = false;  // from choosing what to delete until it is done
     bool listsLoading = false;
     Settings settings;
     bool listsLoaded = false;  // the microphone list came back at least once
@@ -726,6 +732,7 @@ void updateFormEnabled() {
     int source = (int)SendMessageW(form.source, CB_GETCURSEL, 0, 0);
     EnableWindow(form.mic, source != 1);  // computer audio only: no microphone to pick
     EnableWindow(form.start, !form.starting);
+    EnableWindow(form.clean, !form.cleaning);
 }
 
 void createForm() {
@@ -765,6 +772,7 @@ void createForm() {
     label(L"단어 힌트");
     form.prompt = edit(ID_PROMPT, L"전문 용어를 쉼표로 (예: 세마포어, LRU)");
     form.start = makeChild(L"BUTTON", L"녹음 시작", BS_DEFPUSHBUTTON | WS_TABSTOP, ID_START, g.font);
+    form.clean = makeChild(L"BUTTON", L"정리…", BS_PUSHBUTTON | WS_TABSTOP, ID_CLEAN, g.font);
     form.status = makeChild(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, ID_FORM_STATUS, g.font);
 
     const Settings &s = form.settings;
@@ -807,6 +815,7 @@ int layoutForm(int m, int y, int w) {
     y += S(4);
     const int startW = S(116), startH = S(30);
     SetWindowPos(form.start, nullptr, m + w - startW, y, startW, startH, SWP_NOZORDER);
+    SetWindowPos(form.clean, nullptr, m, y, S(72), startH, SWP_NOZORDER);
     y += startH;
     if (GetWindowTextLengthW(form.status)) {
         // measure the status text so long errors wrap instead of being cut off
@@ -903,13 +912,13 @@ struct StartResult {
 };
 
 /** The CLI's error line without its "scriptorium: " prefix and usage hint. */
-std::wstring cliError(const RunResult &r) {
+std::wstring cliError(const RunResult &r, const std::wstring &fallback = L"녹음을 시작하지 못했어요") {
     std::wstring err = wide(r.err);
     size_t i = err.rfind(L"scriptorium: ");
     if (i != std::wstring::npos) err = err.substr(i + 13);
     if (size_t hint = err.find(L"\nRun \"scriptorium help\""); hint != std::wstring::npos) err = err.substr(0, hint);
     while (!err.empty() && (err.back() == L'\n' || err.back() == L'\r')) err.pop_back();
-    if (err.empty()) err = L"녹음을 시작하지 못했어요 (종료 코드 " + std::to_wstring(r.exitCode) + L")";
+    if (err.empty()) err = fallback + L" (종료 코드 " + std::to_wstring(r.exitCode) + L")";
     return err;
 }
 
@@ -1173,7 +1182,7 @@ std::wstring tooltipText() {
 /** Background mode (and "종료" while busy) ends by itself a little while after the last piece of work. */
 void checkIdleExit() {
     // a start in flight, an open window or an open prompt keeps the app
-    bool inUse = form.starting || g.modal || IsWindowVisible(g.wnd);
+    bool inUse = form.starting || form.cleaning || g.modal || IsWindowVisible(g.wnd);
     if ((g.resident && !g.exitWhenIdle) || g.probe || busy() || inUse) {
         g.idleSince = 0;
         return;
@@ -1258,6 +1267,121 @@ void requestExit() {
     poll();
 }
 
+// ---- cleaning up ----------------------------------------------------------------------
+
+/** What `clean` found or deleted in one folder. */
+struct CleanPart {
+    bool asked = false;
+    int count = 0, inUse = 0, failed = 0;
+    double bytes = 0;
+};
+
+struct CleanResult {
+    bool ok = false;
+    bool preview = false;  // --dry-run: nothing was deleted
+    std::wstring target;   // recordings | run | all
+    CleanPart recordings, run;
+    std::wstring message;
+
+    int count() const { return recordings.count + run.count; }
+    int inUse() const { return recordings.inUse + run.inUse; }
+    int failed() const { return recordings.failed + run.failed; }
+};
+
+std::wstring sizeText(double bytes) {
+    wchar_t buf[32];
+    if (bytes >= 1e9) swprintf_s(buf, L"%.1f GB", bytes / 1e9);
+    else if (bytes >= 1e6) swprintf_s(buf, L"%.1f MB", bytes / 1e6);
+    else swprintf_s(buf, L"%.0f KB", std::ceil(bytes / 1e3));
+    return buf;
+}
+
+CleanPart cleanPart(const Json &j, const wchar_t *name) {
+    CleanPart p;
+    const Json *o = j.get(name);
+    if (!o || o->type != Json::Object) return p;
+    auto length = [o](const wchar_t *key) {
+        const Json *a = o->get(key);
+        return a && a->type == Json::Array ? (int)a->arr.size() : 0;
+    };
+    p.asked = true;
+    p.count = (int)o->number(L"count");
+    p.bytes = o->number(L"bytes");
+    p.inUse = length(L"inUse");
+    p.failed = length(L"failed");
+    return p;
+}
+
+/** Runs `clean <target>` off the UI thread; the CLI decides what is in use and leaves it. */
+void runClean(const std::wstring &target, bool preview) {
+    std::vector<std::wstring> args = cliArgs({L"clean", target});
+    if (preview) args.push_back(L"--dry-run");
+    HWND wnd = g.wnd;
+    std::thread([wnd, args, target, preview] {
+        auto *res = new CleanResult();
+        res->target = target;
+        res->preview = preview;
+        RunResult r = runAndCapture(args, 120000);
+        Json j;
+        // exit code 1 with a result: some files could not be deleted (counted in failed)
+        if (r.started && parseJson(r.out, j) && j.type == Json::Object) {
+            res->ok = true;
+            res->recordings = cleanPart(j, L"recordings");
+            res->run = cleanPart(j, L"run");
+        } else {
+            res->message = r.started ? cliError(r, L"정리하지 못했어요") : L"node.exe를 실행하지 못했어요";
+        }
+        if (!PostMessageW(wnd, WM_CLEAN_DONE, 0, reinterpret_cast<LPARAM>(res))) delete res;
+    }).detach();
+}
+
+/** Looks at what there is to delete first; onCleanDone then asks before deleting. */
+void startClean(const std::wstring &target) {
+    if (form.cleaning) return;
+    if (!cliReady()) {
+        modalBox(L"Scriptorium 명령줄 도구를 찾지 못했어요.", MB_OK | MB_ICONWARNING, L"Scriptorium 정리");
+        return;
+    }
+    form.cleaning = true;
+    updateFormEnabled();
+    runClean(target, true);
+}
+
+void onCleanDone(std::unique_ptr<CleanResult> res) {
+    const wchar_t *caption = L"Scriptorium 정리";
+    auto done = [] {
+        form.cleaning = false;
+        updateFormEnabled();
+    };
+    std::wstring kept = res->inUse() ? L"\n작업 중인 항목 " + std::to_wstring(res->inUse()) + L"개는 그대로 " : L"";
+    if (!res->ok) {
+        modalBox(res->message, MB_OK | MB_ICONWARNING, caption);
+    } else if (res->preview && !res->count()) {
+        modalBox(L"지울 항목이 없어요." + (kept.empty() ? L"" : L"\n" + kept + L"둬요."), MB_OK | MB_ICONINFORMATION, caption);
+    } else if (res->preview) {
+        std::wstring text = L"다음 항목을 지울까요? 지우면 되돌릴 수 없어요.\n";
+        if (res->recordings.count)
+            text += L"\n• 이전 녹음 음성 (recordings): " + std::to_wstring(res->recordings.count) + L"개, " + sizeText(res->recordings.bytes);
+        if (res->run.count)
+            text += L"\n• 작업 기록 (run): " + std::to_wstring(res->run.count) + L"개, " + sizeText(res->run.bytes);
+        text += L"\n";
+        if (!kept.empty()) text += kept + L"둬요.";
+        text += L"\n노트와 전사 내용은 지우지 않아요.";
+        bool yes = modalBox(text, MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2, caption) == IDOK;
+        if (!IsWindow(g.wnd)) return;  // closed while the question was open
+        if (yes) {
+            runClean(res->target, false);
+            return;  // still cleaning
+        }
+    } else {
+        std::wstring text = std::to_wstring(res->count()) + L"개, " + sizeText(res->recordings.bytes + res->run.bytes) + L"를 지웠어요.";
+        if (res->failed()) text += L"\n" + std::to_wstring(res->failed()) + L"개는 지우지 못했어요.";
+        if (!kept.empty()) text += kept + L"뒀어요.";
+        modalBox(text, MB_OK | (res->failed() ? MB_ICONWARNING : MB_ICONINFORMATION), caption);
+    }
+    if (IsWindow(g.wnd)) done();
+}
+
 // ---- start with Windows -----------------------------------------------------------------------
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -1292,6 +1416,24 @@ void setAutostart(bool on) {
 
 // ---- menu -----------------------------------------------------------------------------------
 
+/** The choices of 정리, for the tray menu and the window's button. The folder names tell them from Documents\Scriptorium. */
+void appendCleanItems(HMENU menu) {
+    UINT flags = MF_STRING | (form.cleaning ? MF_GRAYED : MF_ENABLED);
+    AppendMenuW(menu, flags, ID_CLEAN_RECORDINGS, L"이전 녹음 음성 비우기 (recordings)…");
+    AppendMenuW(menu, flags, ID_CLEAN_RUN, L"작업 기록 비우기 (run)…");
+    AppendMenuW(menu, flags, ID_CLEAN_ALL, L"모두 비우기…");
+}
+
+/** The window's 정리 button: its choices, opening above it. */
+void showCleanMenu() {
+    RECT rc;
+    GetWindowRect(form.clean, &rc);
+    HMENU menu = CreatePopupMenu();
+    appendCleanItems(menu);
+    TrackPopupMenuEx(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_LEFTBUTTON, rc.left, rc.top, g.wnd, nullptr);
+    DestroyMenu(menu);
+}
+
 void showMenu(POINT pt) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_SHOW, L"열기");
@@ -1309,6 +1451,9 @@ void showMenu(POINT pt) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_OPEN_OUTPUT, L"녹음 폴더 열기");
     AppendMenuW(menu, MF_STRING, ID_OPEN_DATA, L"데이터 폴더 열기");
+    HMENU cleanMenu = CreatePopupMenu();  // destroyed with its parent
+    appendCleanItems(cleanMenu);
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(cleanMenu), L"정리");
     AppendMenuW(menu, MF_STRING | (autostartEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_AUTOSTART, L"Windows 시작 시 실행");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"종료");
@@ -1355,6 +1500,12 @@ void onCommand(UINT id, UINT code) {
     case ID_SHOW: showWindow(); break;
     case ID_OPEN_DATA: openDataFolder(); break;
     case ID_OPEN_OUTPUT: openOutputFolder(); break;
+    case ID_CLEAN:
+        if (code == BN_CLICKED) showCleanMenu();
+        break;
+    case ID_CLEAN_RECORDINGS: startClean(L"recordings"); break;
+    case ID_CLEAN_RUN: startClean(L"run"); break;
+    case ID_CLEAN_ALL: startClean(L"all"); break;
     case ID_AUTOSTART: setAutostart(!autostartEnabled()); break;
     case ID_STOP_ALL:
         stopAllRecordings();
@@ -1504,6 +1655,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_START_DONE:
         onStartDone(std::unique_ptr<StartResult>(reinterpret_cast<StartResult *>(lp)));
+        return 0;
+    case WM_CLEAN_DONE:
+        onCleanDone(std::unique_ptr<CleanResult>(reinterpret_cast<CleanResult *>(lp)));
         return 0;
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);  // closing hides; "종료" in the tray menu exits

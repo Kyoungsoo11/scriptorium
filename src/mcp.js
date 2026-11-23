@@ -292,7 +292,7 @@ function readJob(env, id) {
   const dir = jobsDir(env);
   if (!/^[0-9a-f]{12}$/.test(String(id))) throw new ToolError(`Unknown job ${id}`);
   const metaFile = path.join(dir, `${id}.json`);
-  if (!fs.existsSync(metaFile)) throw new ToolError(`Unknown job ${id}`);
+  if (!fs.existsSync(metaFile)) throw new ToolError(`Unknown job ${id} (finished jobs may have been cleaned up; the transcript is in scriptorium_list_notes)`);
   const job = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
   const read = ext => {
     try {

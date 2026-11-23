@@ -96,6 +96,7 @@ scriptorium.cmd transcribe "D:\강의\3주차.mp4" --lang ko --out 3주차.srt
 - **새 녹음**: 제목(비우면 날짜와 시간), 소리(마이크 + 컴퓨터 소리 / 컴퓨터 소리만 / 마이크만), 마이크, 언어. **고급 설정**: 화자 수, 시간 제한(`50m`, `1h30m`), 단어 힌트. **녹음 시작**(또는 Enter). 녹음이 진행 중이어도 더 시작할 수 있다
 - 같은 제목의 녹음이 이미 있으면 덮어쓸지 묻는다. **아니요**를 누르면 제목을 바꿔 다시 시작하면 된다
 - 마지막으로 고른 소리·마이크·언어는 기억한다
+- **정리…**: 쌓인 파일 비우기. 이전 녹음 음성(`recordings`), 작업 기록(`run`), 모두 중에서 고르면 몇 개, 몇 MB인지 보여 주고 확인한 뒤 지운다 → [clean](#clean--쌓인-파일-정리)
 
 **녹음 결과**: `문서\Scriptorium` 폴더에 제목 이름으로 두 파일이 생긴다 (예: `자료구조 7주차.wav`, `자료구조 7주차.txt`). 전사본은 아래처럼 시간과 문장이 번갈아 나온다. 화자가 2명 이상이면 시간 옆에 화자 이름이 붙고, 화자 이름을 바꾸면 전사본도 다시 쓴다.
 
@@ -107,7 +108,7 @@ scriptorium.cmd transcribe "D:\강의\3주차.mp4" --lang ko --out 3주차.srt
 그리고 컴퓨터 알고리즘의 성능을 어떤 식으로 표현을 할 것인지 …
 ```
 
-**트레이 아이콘**: 평소 모양 / 빨간 점 = 녹음 중 / 파란 점 = 전사 중(파일 전사, 녹음 마무리). 마우스를 올리면 개수가 보인다. 오른쪽 클릭 메뉴: 열기, 녹음별 정지, 녹음 모두 정지, 녹음 폴더 열기, 데이터 폴더 열기, Windows 시작 시 실행, 종료.
+**트레이 아이콘**: 평소 모양 / 빨간 점 = 녹음 중 / 파란 점 = 전사 중(파일 전사, 녹음 마무리). 마우스를 올리면 개수가 보인다. 오른쪽 클릭 메뉴: 열기, 녹음별 정지, 녹음 모두 정지, 녹음 폴더 열기, 데이터 폴더 열기, 정리, Windows 시작 시 실행, 종료.
 
 **알림**: 녹음·전사가 끝나거나 실패하면(녹음이면 저장한 전사본 파일 이름과 함께), 그리고 녹음 중 마이크에서 소리가 안 들어오면 Windows 알림을 띄운다 (방해 금지 중에는 안 뜬다).
 
@@ -132,6 +133,7 @@ scriptorium <명령> [옵션]
 | `status` | 실행 중인 녹음 목록 |
 | `notes …` | 노트 목록·보기·내보내기·이름 변경·이동·삭제 |
 | `speakers rename …` | 화자 이름 붙이기 |
+| `clean …` | 쌓인 파일 정리 (`recordings`, `run` 폴더 비우기) |
 | `app` | 트레이 앱 열기 |
 | `devices` | 오디오 장치 목록 |
 | `doctor` | 엔진·모델·오디오 장치 점검 |
@@ -234,6 +236,22 @@ scriptorium speakers rename <noteId> SPEAKER_00 "김교수"   # 내보내기와 
 ```
 
 0.6.0에서 폴더 기능(`folders`, `notes move`, `--folder`)을 없앴다. 노트는 검색(`notes list --search`)으로 찾고, 파일은 `문서\Scriptorium`에서 본다.
+
+### clean — 쌓인 파일 정리
+
+```bash
+scriptorium clean                  # 지울 수 있는 것만 보여 줌 (지우지 않음)
+scriptorium clean recordings       # 0.4.0까지의 녹음 음성(<noteId>.wav) 지우기
+scriptorium clean run              # 로그, 끝난 작업 기록 지우기
+scriptorium clean all              # 둘 다
+scriptorium clean all --dry-run    # 지우지 않고 미리 보기
+```
+
+- 데이터 폴더(`%USERPROFILE%\.scriptorium`)의 `recordings`와 `run`만 비운다. **노트와 전사 내용(`scriptorium.db`), `문서\Scriptorium`의 파일은 지우지 않는다.**
+- **작업 중인 항목은 남긴다**: 녹음·마무리·전사 중인 작업의 음성, 상태 파일, 로그와, 다른 프로그램이 열어 둔 파일. 결과의 `inUse`에 나온다.
+- 휴지통을 거치지 않으므로 **되돌릴 수 없다**. `recordings`의 WAV를 지우면 그 강의를 다시 듣거나 다시 전사할 수 없다 (저장된 전사 내용은 남는다).
+- 지우지 못한 파일이 있으면 결과의 `failed`에 나오고 종료 코드 1.
+- 트레이 앱에서는 창의 **정리…** 버튼이나 아이콘 메뉴의 **정리**.
 
 ### devices / doctor
 
@@ -496,7 +514,7 @@ scriptorium notes export <noteId> --out 회의.md
 |---|---|
 | 노트 DB (SQLite) | `%USERPROFILE%\.scriptorium\scriptorium.db` |
 | 녹음 WAV와 전사본 | `문서\Scriptorium\<제목>.wav`, `<제목>.txt` (0.4.0까지의 녹음은 `%USERPROFILE%\.scriptorium\recordings\<noteId>.wav`에 그대로 있다) |
-| 실행 중 녹음·전사 상태, 로그, 끝난 작업 알림 | `%USERPROFILE%\.scriptorium\run\` (`recording-*.json`, `transcribe-*.json`, `finished-*.json`, `app.json`) |
+| 실행 중 녹음·전사 상태, 로그, 끝난 작업 알림 | `%USERPROFILE%\.scriptorium\run\` (`recording-*.json`, `transcribe-*.json`, `finished-*.json`, `app.json`). `scriptorium clean run`으로 비운다 |
 | 트레이 앱 설정 (마지막 선택) | `%USERPROFILE%\.scriptorium\gui.json` |
 | 모델 | 프로그램 폴더 `models\` |
 
