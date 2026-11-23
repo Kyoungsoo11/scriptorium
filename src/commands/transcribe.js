@@ -45,7 +45,7 @@ async function cmdTranscribe(env, opts, files) {
   const stream = streamer(opts);
   const results = [];
   // Shown by the tray app while this runs.
-  const activity = new TranscribeState(env, { count: files.length });
+  const activity = new TranscribeState(env, { count: files.length, files: targets.map(t => t.abs) });
   // Ctrl+C or a kill from MCP: leave no state file behind and say the file did not finish.
   let current = null;
   const onSignal = () => {

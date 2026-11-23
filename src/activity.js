@@ -6,6 +6,7 @@
 //   recording-<id>.stop            asks that recording to stop (written by `stop` and the tray app)
 //   recording-<id>.pause           while it exists the recording is paused (`pause`/`resume`, tray app)
 //   transcribe-<pid>.json          a file transcription in progress, with progress in seconds
+//                                  and every file it will read (`clean` leaves those alone)
 //   finished-<kind>-<id>.json      one piece of work that ended (ok or not); the tray app shows a
 //                                  notice and deletes it. Notices older than a week are pruned.
 //
@@ -80,9 +81,9 @@ function writeFinished(env, { kind, id, title, ok, noteId = null, error = null, 
 
 /** The state file of one file transcription; one per process, updated as it goes. */
 class TranscribeState {
-  constructor(env, { count }) {
+  constructor(env, { count, files = [] }) {
     this.file = path.join(env.runDir, `transcribe-${process.pid}.json`);
-    this.state = { kind: 'transcribe', pid: process.pid, count, index: 0, startedAt: new Date().toISOString() };
+    this.state = { kind: 'transcribe', pid: process.pid, count, files, index: 0, startedAt: new Date().toISOString() };
   }
 
   update(fields) {
