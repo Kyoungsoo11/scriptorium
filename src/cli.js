@@ -1,29 +1,24 @@
 'use strict';
 // scriptorium: non-interactive CLI. Every command runs to completion from its options alone,
 // prints one JSON result on stdout (or the requested transcript format), logs on stderr,
-// and exits 0 on success, 1 on failure, 2 on bad usage, 3 when a recording's file name is taken.
+// and exits 0 on success, 1 on failure, 2 on bad usage, 3 when an output file name is taken.
+//
+// The commands live in src/commands/: transcribe, record (record/stop/pause/resume/status),
+// notes (notes/speakers), setup (app/devices/doctor); common holds what they share.
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { spawn } = require('node:child_process');
-
-const { resolveEnv, checkRequired } = require('./env');
-const { Store, UsageError } = require('./store');
-const { parseArgs, parseDuration } = require('./args');
-const { WavWriter, rms } = require('./audio');
-const { decodeFile, Capture, listDevices } = require('./native');
-const { TranscriptionRun } = require('./transcriber');
-const { render, fromAltEntries, FORMATS } = require('./format');
-const { writeJsonAtomic, writeFinished, TranscribeState } = require('./activity');
-const { keepTrayApp } = require('./tray');
-const { outputDir, recordingPaths, checkNames, takenNames, defaultTitle, isOwnFile } = require('./output');
-
-const VERSION = require('../package.json').version;
+const { resolveEnv } = require('./env');
+const { UsageError } = require('./store');
+const { parseArgs } = require('./args');
+const { printJson } = require('./commands/common');
+const { cmdTranscribe } = require('./commands/transcribe');
+const { cmdRecord, cmdStop, setPaused, recordingStatus } = require('./commands/record');
+const { cmdNotes, cmdSpeakers } = require('./commands/notes');
+const { withTrayApp, cmdApp, cmdDevices, cmdDoctor, VERSION } = require('./commands/setup');
 
 const GLOBAL_VALUES = ['data-dir', 'models-dir', 'whisper-model', 'native', 'log-file'];
 const GLOBAL_BOOLEANS = ['quiet', 'help'];
-const TRANSCRIBE_VALUES = ['lang', 'prompt', 'backend', 'gpu', 'threads', 'beam', 'speakers', 'vad-threshold', 'title', 'folder', 'format', 'out'];
-const TRANSCRIBE_BOOLEANS = ['diarize', 'save', 'stream'];
+const TRANSCRIBE_VALUES = ['lang', 'prompt', 'backend', 'gpu', 'threads', 'beam', 'speakers', 'vad-threshold', 'title', 'format', 'out', 'output-dir'];
+const TRANSCRIBE_BOOLEANS = ['diarize', 'save', 'stream', 'text', 'overwrite'];
 
 const HELP = `Scriptorium ${VERSION} - offline lecture/meeting transcription (no server, no account)
 
@@ -38,14 +33,12 @@ Transcription
   status                           show running recordings
 
 Notes
-  notes list [--folder <name|id|null>] [--search <text>] [--limit <n>]
+  notes list [--search <text>] [--limit <n>]
   notes show <noteId> [--format json|srt|vtt|txt|md|timed]
   notes export <noteId> --format <fmt> --out <file>
   notes rename <noteId> <title>
-  notes move <noteId> <folder|null>
-  notes delete <noteId> [--keep-audio]
-  folders list | folders create <name> [--parent <id>] | folders delete <id>
-  speakers rename <noteId> <SPEAKER_00> <name>
+  notes delete <noteId> [--keep-files]
+  speakers rename <noteId> <SPEAKER_00> <name>   (also rewrites the note's .txt)
 
 App
   app                              open the Scriptorium tray app (start recordings, see what is running)
@@ -57,6 +50,11 @@ Setup
                                    register Scriptorium with Claude Desktop (then restart Claude)
   mcp                              run as an MCP server on stdin/stdout (Claude Desktop starts this)
 
+Files
+  Each recording is saved as <title>.wav plus its transcript <title>.txt ("(mm:ss)" then the
+  text, written as it goes) in Documents\\Scriptorium; a transcribed file gets <title>.txt there
+  (title = file name). A taken name stops before anything starts (exit code 3).
+
 Transcription options (transcribe, record)
   --lang <code|auto>      language, e.g. ko, en (default: auto-detect)
   --no-diarize            skip speaker separation
@@ -64,831 +62,49 @@ Transcription options (transcribe, record)
   --prompt <text>         vocabulary/context hint for Whisper
   --backend <auto|cpu|gpu>  gpu needs the GPU build (default auto)
   --gpu <index>           pin a GPU
-  --threads <n>           CPU threads (default: up to 16)
+  --threads <n>           CPU threads (default: the CPU shared with the work already running, up to 16)
   --beam <n>              beam size; 1 = greedy, faster (default 5)
   --vad-threshold <0-1>   speech detection sensitivity; lower keeps quieter speech (default 0.15)
-  --title <text>          note title (default: file name / date)
-  --folder <name|id>      put the note in a folder (created if missing)
-  --no-save               do not store a note, only print the result
+  --title <text>          title, and the file name (default: file name / start time)
+  --output-dir <dir>      folder for the .wav/.txt (default Documents\\Scriptorium, or SCRIPTORIUM_OUTPUT)
+  --overwrite             replace an existing <title>.wav/.txt
+  --no-text               do not write the <title>.txt
+  --no-save               do not store a note
   --format <fmt>          print the transcript as json|srt|vtt|txt|md|timed instead of the result JSON
-  --out <file>            write the transcript to a file (format from --format or extension)
+  --out <file>            also write the transcript to this file (format from --format or extension)
   --stream                print JSON lines while running: started, segment..., done
 
 Record options
-  A recording is saved as <title>.wav with its transcript <title>.txt ("(mm:ss)" then the text)
-  in Documents\\Scriptorium. Without --title the title is the start time, e.g. "2026-11-23 14-30".
   --duration <time>       stop after e.g. 90s, 45m, 1h30m of recorded time (default: until stopped)
   --mic <id|default|none> microphone (default: system default; none = system audio only)
   --no-system             do not capture system audio (microphone only)
-  --stop-file <path>      stop when this file appears
-  --output-dir <dir>      folder for the .wav and .txt (default Documents\\Scriptorium,
-                          or SCRIPTORIUM_OUTPUT)
-  --overwrite             replace an existing <title>.wav/.txt (otherwise: exit code 3)
   --audio-out <file.wav>  save the recording here instead (the .txt goes next to it)
-  --no-audio              do not keep the recording (the .txt is still written)
+  --no-audio              do not keep the recording
   --detach                start in the background, print the note id and return
-  Stops on: --duration, --stop-file, "scriptorium stop", Ctrl+C.
-  Pauses with "scriptorium pause" until "scriptorium resume".
+  Stops on: --duration, "scriptorium stop", Ctrl+C. Pauses with "scriptorium pause" until "resume".
 
 Global options
-  --data-dir <dir>        notes database and recordings (default %USERPROFILE%\\.scriptorium)
+  --data-dir <dir>        notes database and run state (default %USERPROFILE%\\.scriptorium)
   --models-dir <dir>      model folder (default: models next to scriptorium)
   --whisper-model <file>  a different ggml Whisper model (e.g. a smaller, faster one)
   --quiet                no progress on stderr
 `;
 
-// ---- helpers -----------------------------------------------------------------
-
-function makeLog(opts) {
-  return msg => {
-    if (!opts.quiet) process.stderr.write(`[scriptorium] ${msg}\n`);
-  };
-}
-
-function printJson(data) {
-  process.stdout.write(`${JSON.stringify(data, null, process.stdout.isTTY ? 2 : 0)}\n`);
-}
-
-function openStore(env) {
-  return new Store(env.dbPath);
-}
-
-function transcriptionOptions(opts) {
-  if (opts.backend && !['auto', 'cpu', 'gpu'].includes(opts.backend))
-    throw new UsageError('--backend takes auto, cpu or gpu');
-  const fraction = (name, v) => {
-    if (v === undefined) return undefined;
-    const n = Number(v);
-    if (!(n > 0 && n < 1)) throw new UsageError(`--${name} takes a number between 0 and 1`);
-    return n;
-  };
-  const positive = (name, v) => {
-    if (v === undefined) return undefined;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n < 1) throw new UsageError(`--${name} takes a whole number of 1 or more`);
-    return n;
-  };
-  if (opts.format && !FORMATS.includes(opts.format))
-    throw new UsageError(`--format takes ${FORMATS.join(', ')}`);
-  return {
-    language: opts.lang && opts.lang !== 'auto' ? opts.lang : undefined,
-    diarize: opts.diarize !== false,
-    prompt: opts.prompt,
-    speakers: positive('speakers', opts.speakers),
-    useGpu: opts.backend !== 'cpu',
-    gpu: opts.gpu,
-    threads: positive('threads', opts.threads),
-    beam: positive('beam', opts.beam),
-    vadThreshold: fraction('vad-threshold', opts['vad-threshold']),
-  };
-}
-
-function requireModels(env, options) {
-  const missing = checkRequired(env, options).filter(r => !r.ok);
-  if (missing.length) {
-    throw new Error(
-      `Missing ${missing.map(m => `${m.name} (${m.path})`).join(', ')}. ` +
-        'Run "scriptorium doctor" to see what is missing.',
-    );
-  }
-}
-
-function formatFor(opts, outFile) {
-  if (opts.format) return opts.format;
-  const ext = outFile ? path.extname(outFile).slice(1).toLowerCase() : '';
-  return FORMATS.includes(ext) ? ext : 'json';
-}
-
-/** Prints or writes a finished run per --format/--out/--stream. */
-function deliver(result, opts, { stream, title }) {
-  const out = opts.out;
-  if (out) {
-    fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
-    fs.writeFileSync(out, render(result.segments, formatFor(opts, out), { title }));
-  }
-  const summary = { ...result, ...(out ? { saved: path.resolve(out) } : {}) };
-  if (stream) {
-    const { segments, ...rest } = summary;
-    stream({ event: 'done', ...rest, segmentCount: segments.length });
-    return;
-  }
-  if (opts.format && !out) {
-    process.stdout.write(render(result.segments, opts.format, { title }));
-    return;
-  }
-  printJson(summary);
-}
-
-function streamer(opts) {
-  return opts.stream ? event => process.stdout.write(`${JSON.stringify(event)}\n`) : null;
-}
-
-// ---- transcribe ----------------------------------------------------------------
-
-async function cmdTranscribe(env, opts, files) {
-  if (files.length === 0) throw new UsageError('transcribe needs at least one file');
-  if (opts.out && files.length > 1) throw new UsageError('--out takes one input file; run once per file');
-  const log = makeLog(opts);
-  const options = transcriptionOptions(opts);
-  requireModels(env, options);
-  const store = opts.save === false ? null : openStore(env);
-  const folder = store ? store.resolveFolder(opts.folder, { create: true }) : null;
-  const stream = streamer(opts);
-  const results = [];
-  // Shown by the tray app while this runs.
-  const activity = new TranscribeState(env, { count: files.length });
-  // Ctrl+C or a kill from MCP: leave no state file behind and say the file did not finish.
-  let current = null;
-  const onSignal = () => {
-    activity.close();
-    if (current) writeFinished(env, { kind: 'transcribe', ...current, ok: false, error: 'interrupted' });
-    process.exit(130);
-  };
-  const signals = ['SIGINT', 'SIGTERM', 'SIGBREAK'];
-  signals.forEach(s => process.on(s, onSignal));
-  try {
-    for (const [index, file] of files.entries()) {
-      const abs = path.resolve(file);
-      if (!fs.existsSync(abs)) throw new UsageError(`No such file: ${file}`);
-      const title = opts.title || path.parse(abs).name;
-      current = { id: `${process.pid}-${index}`, title };
-      let total = null;
-      const run = new TranscriptionRun({
-        env,
-        store,
-        note: { title, type: 'file', folderId: folder?.id, sourcePath: abs },
-        options,
-        log,
-        onEvent: stream || undefined,
-      });
-      const started = Date.now();
-      const tick = () =>
-        activity.update({ totalSeconds: total, doneSeconds: Math.round(Math.min(run.transcribedSeconds, total ?? Infinity)) });
-      activity.update({ index, title, file: abs, phase: 'transcribing', totalSeconds: null, doneSeconds: 0 });
-      const progress = setInterval(() => {
-        const sec = run.transcribedSeconds;
-        log(`  transcribed ${Math.round(sec)} s${total ? ` / ${Math.round(total)} s (${Math.round((sec / total) * 100)}%)` : ''}`);
-      }, 15000);
-      const ticker = setInterval(tick, 2000);
-      try {
-        await run.start();
-        await decodeFile(env, abs, {
-          onInfo: info => {
-            total = info.duration > 0 ? info.duration : null;
-            log(`transcribing ${path.basename(abs)}${total ? ` (${Math.round(total)} s)` : ''} on ${run.backend}`);
-            tick();
-          },
-          onChunk: chunk => run.feed(chunk),
-        });
-        clearInterval(ticker);
-        activity.update({ phase: 'finishing' });
-        const result = await run.finish();
-        clearInterval(progress);
-        result.sourcePath = abs;
-        result.elapsedSeconds = Math.round((Date.now() - started) / 100) / 10;
-        log(`done: ${result.segments.length} segments, ${result.speakers.length} speakers, ${result.elapsedSeconds} s`);
-        deliver(result, opts, { stream, title });
-        writeFinished(env, { kind: 'transcribe', ...current, ok: true, noteId: result.noteId });
-        current = null;
-        results.push(result);
-      } catch (err) {
-        clearInterval(progress);
-        clearInterval(ticker);
-        writeFinished(env, { kind: 'transcribe', ...current, ok: false, noteId: run.note?.id ?? null, error: err.message });
-        current = null;
-        throw await run.fail(err);
-      }
-    }
-  } finally {
-    signals.forEach(s => process.off(s, onSignal));
-    activity.close();
-    store?.close();
-  }
-  return results;
-}
-
-// ---- record ------------------------------------------------------------------
-
-function stateFiles(env) {
-  if (!fs.existsSync(env.runDir)) return [];
-  return fs
-    .readdirSync(env.runDir)
-    .filter(f => f.startsWith('recording-') && f.endsWith('.json'))
-    .map(f => {
-      const file = path.join(env.runDir, f);
-      try {
-        return { file, ...JSON.parse(fs.readFileSync(file, 'utf8')) };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-}
-
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e.code === 'EPERM';
-  }
-}
-
-/** Running recordings; removes state left by a recorder that died. */
-function runningRecordings(env) {
-  return stateFiles(env).filter(s => {
-    if (alive(s.pid)) return true;
-    fs.rmSync(s.file, { force: true });
-    return false;
-  });
-}
-
-/** Seconds actually recorded so far (pauses left out), from a recording's state file. */
-function recordedSeconds(s, now = Date.now()) {
-  const paused = (s.pausedMs || 0) + (s.paused && s.pausedAt ? now - Date.parse(s.pausedAt) : 0);
-  return Math.max(0, Math.round((now - Date.parse(s.startedAt) - paused) / 1000));
-}
-
-/**
- * Title and file paths of a new recording. A given --title must be free (or --overwrite); the
- * default title (the start time) takes the next free "title (2)", "title (3)", ...
- */
-function recordingTarget(env, opts, startedAt) {
-  const dir = outputDir(opts);
-  const running = runningRecordings(env);
-  const make = title => ({
-    title,
-    paths: recordingPaths({ dir, title, audioOut: opts['audio-out'], audio: opts.audio !== false }),
-  });
-  if (opts.title || opts['audio-out']) {
-    const target = make(opts.title || path.parse(opts['audio-out']).name);
-    checkNames(target.paths, running, { overwrite: opts.overwrite });
-    return target;
-  }
-  const base = defaultTitle(startedAt);
-  for (let n = 1; ; n++) {
-    const target = make(n === 1 ? base : `${base} (${n})`);
-    if (!takenNames(target.paths, running).length) return target;
-  }
-}
-
-/** Finds the running recordings `pause`/`resume`/`stop` act on: --id, --all, or the only one. */
-function pickRecordings(running, opts, verb) {
-  if (opts.id) {
-    const found = running.filter(s => s.noteId === opts.id || String(s.pid) === opts.id);
-    if (!found.length) throw new UsageError(`No running recording ${opts.id}`);
-    return found;
-  }
-  if (!running.length) throw new UsageError('No recording is running');
-  if (!opts.all && running.length > 1)
-    throw new UsageError(`${running.length} recordings are running; pass --id <noteId> or --all to ${verb}`);
-  return running;
-}
-
-/** `pause` / `resume`: the recorder polls recording-<id>.pause every 250 ms. */
-async function cmdPause(env, opts, pause) {
-  const targets = pickRecordings(runningRecordings(env), opts, pause ? 'pause' : 'resume');
-  for (const t of targets) {
-    const file = t.file.replace(/\.json$/, '.pause');
-    if (pause) fs.writeFileSync(file, '');
-    else fs.rmSync(file, { force: true });
-  }
-  // wait (briefly) until each recorder says so in its state file
-  const deadline = Date.now() + 3000;
-  let states = targets;
-  while (Date.now() < deadline) {
-    states = targets.map(t => stateFiles(env).find(s => s.file === t.file) ?? t);
-    if (states.every(s => Boolean(s.paused) === pause || !alive(s.pid))) break;
-    await new Promise(r => setTimeout(r, 150));
-  }
-  const out = states.map(s => ({ noteId: s.noteId, title: s.title, paused: Boolean(s.paused), recordedSeconds: recordedSeconds(s) }));
-  printJson(out.length === 1 ? out[0] : out);
-}
-
-async function cmdRecordDetached(env, opts, argv) {
-  // Check the options here, so a mistake is reported directly instead of as "did not start".
-  const options = transcriptionOptions(opts);
-  if (opts.duration) {
-    try {
-      parseDuration(opts.duration);
-    } catch (e) {
-      throw new UsageError(e.message);
-    }
-  }
-  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
-  // A taken name is reported here (exit 3), not as "the recorder did not start".
-  recordingTarget(env, opts, new Date());
-  requireModels(env, options);
-  fs.mkdirSync(env.runDir, { recursive: true });
-  const logFile = opts['log-file'] ? path.resolve(opts['log-file']) : path.join(env.runDir, `record-${Date.now()}.log`);
-  const args = ['record', ...argv.filter(a => a !== '--detach' && a !== '--stream')];
-  const fd = fs.openSync(logFile, 'a');
-  const child = spawn(process.execPath, [path.join(__dirname, '..', 'bin', 'scriptorium.js'), ...args], {
-    detached: true,
-    stdio: ['ignore', fd, fd],
-    windowsHide: true,
-  });
-  child.unref();
-  fs.closeSync(fd);
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 300));
-    const state = stateFiles(env).find(s => s.pid === child.pid);
-    if (state) {
-      const { file, ...info } = state;
-      printJson({ detached: true, ...info, log: logFile, stop: 'scriptorium stop' + (info.noteId ? ` --id ${info.noteId}` : '') });
-      return;
-    }
-    if (!alive(child.pid)) break;
-  }
-  // The recorder's own error line, when it wrote one, says more than "did not start".
-  let reason = '';
-  try {
-    const lines = fs.readFileSync(logFile, 'utf8').split(/\r?\n/).filter(l => l.startsWith('scriptorium: '));
-    if (lines.length) reason = `: ${lines[lines.length - 1].slice('scriptorium: '.length)}`;
-  } catch {
-    // no log
-  }
-  throw new Error(`The background recorder did not start${reason} (log: ${logFile})`);
-}
-
-const MUTED_WARNING =
-  'The microphone is muted in Windows, so it records silence. Unmute it (mic mute key, or Settings > System > Sound > Input).';
-// A muted speaker is not reported at all: WASAPI loopback still receives the audio (checked on Realtek),
-// and a systemMuted flag only made agents warn about a problem that does not exist.
-const SILENT_WARNING =
-  'The microphone has sent pure digital silence for 10 s: it is muted (mute key or switch) or blocked. Nothing it hears is being recorded.';
-
-/** Human-readable problems for a recording's mute / silence state. */
-function audioWarnings(a) {
-  const w = [];
-  if (a.microphoneMuted) w.push(MUTED_WARNING);
-  else if (a.microphoneSilent) w.push(SILENT_WARNING);
-  return w;
-}
-
-async function cmdRecord(env, opts, argv) {
-  if (opts.detach) return cmdRecordDetached(env, opts, argv);
-  const log = makeLog(opts);
-  const options = transcriptionOptions(opts);
-  requireModels(env, options);
-  const duration = opts.duration ? parseDuration(opts.duration) : null;
-  const stopFile = opts['stop-file'] ? path.resolve(opts['stop-file']) : null;
-  if (stopFile && fs.existsSync(stopFile)) throw new UsageError(`--stop-file ${stopFile} already exists; remove it first`);
-  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
-  const startedAt = new Date();
-  // Checked before anything starts, so a taken name costs nothing.
-  const { title, paths } = recordingTarget(env, opts, startedAt);
-  const store = opts.save === false ? null : openStore(env);
-  const folder = store ? store.resolveFolder(opts.folder, { create: true }) : null;
-  const stream = streamer(opts);
-
-  const capture = new Capture(env, { mic: opts.mic || 'default', system: opts.system !== false });
-  const run = new TranscriptionRun({
-    env,
-    store,
-    note: { title, type: 'recording', folderId: folder?.id },
-    options,
-    log,
-    onEvent: stream || undefined,
-  });
-  await run.start();
-
-  fs.mkdirSync(env.runDir, { recursive: true });
-  const id = run.note?.id ?? `nosave-${process.pid}`;
-  const statePath = path.join(env.runDir, `recording-${id}.json`);
-  const internalStop = path.join(env.runDir, `recording-${id}.stop`);
-  const pauseFile = path.join(env.runDir, `recording-${id}.pause`);
-  fs.rmSync(pauseFile, { force: true });
-  fs.mkdirSync(path.dirname(paths.txt), { recursive: true });
-  let wav = null;
-  if (paths.wav) wav = new WavWriter(paths.wav);
-
-  let stopReason = null;
-  let resolveStop;
-  const stopped = new Promise(r => (resolveStop = r));
-  const stop = reason => {
-    if (!stopReason) {
-      stopReason = reason;
-      resolveStop();
-    }
-  };
-
-  // Pausing cuts the paused span out: nothing reaches the wav or the recognizer, so the file and
-  // the transcript times count recorded time only.
-  let paused = false;
-  let pausedAt = null;
-  let pausedMs = 0;
-  let lastText = '';
-
-  let level = { sum: 0, n: 0 };
-  capture.on('data', samples => {
-    if (paused) return;
-    wav?.write(samples);
-    run.feed(samples);
-    level.sum += rms(samples);
-    level.n++;
-  });
-  capture.on('warning', m => log(`warning: ${m}`));
-
-  // Mute / digital-silence state, kept in the state file so `status` (and the MCP tools) can show it.
-  // The tray app reads this file too; phase turns "finishing" once the recording was told to stop.
-  const audioState = { microphoneMuted: null, microphoneSilent: false };
-  let stateReady = false;
-  let phase = 'recording';
-  // Never throws: it runs inside capture event handlers, and a failed status update must not stop
-  // the recording (writeJsonAtomic already retries while a reader holds the file).
-  const writeState = () => {
-    if (!stateReady) return;
-    const warnings = audioWarnings(audioState);
-    try {
-      writeStateFile(warnings);
-    } catch (e) {
-      log(`warning: could not update ${statePath}: ${e.message}`);
-    }
-  };
-  const writeStateFile = warnings =>
-    writeJsonAtomic(statePath, {
-      kind: 'recording',
-      phase,
-      pid: process.pid,
-      noteId: run.note?.id ?? null,
-      title,
-      startedAt: startedAt.toISOString(),
-      // recorded time = now - startedAt - pausedMs - (now - pausedAt while paused)
-      paused,
-      pausedAt: pausedAt ? new Date(pausedAt).toISOString() : null,
-      pausedMs,
-      audioPath: wav?.file ?? null,
-      textPath: paths.txt,
-      lastText,
-      stopFile,
-      duration,
-      audio: audioState,
-      ...(warnings.length ? { warnings } : {}),
-    });
-  const finished = (ok, extra) =>
-    writeFinished(env, { kind: 'recording', id, title, ok, noteId: run.note?.id ?? null, ...extra });
-  const setPaused = want => {
-    if (want === paused || phase !== 'recording') return;
-    paused = want;
-    if (want) pausedAt = Date.now();
-    else {
-      pausedMs += Date.now() - pausedAt;
-      pausedAt = null;
-    }
-    log(want ? 'paused' : 'resumed');
-    writeState();
-  };
-  capture.on('started', msg => {
-    audioState.microphoneMuted = msg.microphoneMuted ?? null;
-    for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
-  });
-  capture.on('audio-state', msg => {
-    if (msg.event === 'mute') {
-      audioState.microphoneMuted = msg.muted;
-      log(`${msg.source} ${msg.muted ? 'muted' : 'unmuted'}`);
-    } else if (msg.event === 'silent') {
-      audioState.microphoneSilent = msg.silent;
-      log(msg.silent ? `warning: ${SILENT_WARNING}` : 'microphone signal is back');
-    }
-    writeState();
-  });
-  capture.on('error', e => {
-    log(`capture error: ${e.message}`);
-    stop('error');
-  });
-
-  const onSignal = () => stop('signal');
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
-  process.on('SIGBREAK', onSignal);
-  const timers = [];
-  timers.push(
-    setInterval(() => {
-      if (fs.existsSync(internalStop) || (stopFile && fs.existsSync(stopFile))) stop('stop-file');
-      setPaused(fs.existsSync(pauseFile));
-      // --duration counts recorded time, so a pause does not eat into it
-      if (duration && run.fedSeconds >= duration) stop('duration');
-    }, 250),
-  );
-  timers.push(
-    setInterval(() => {
-      const last = run.segments[run.segments.length - 1];
-      const text = last ? last.text.trim().slice(0, 300) : '';
-      if (text !== lastText) {
-        lastText = text;
-        writeState();
-      }
-    }, 1000),
-  );
-  timers.push(
-    setInterval(() => {
-      const avg = level.n ? level.sum / level.n : 0;
-      level = { sum: 0, n: 0 };
-      log(`recording ${Math.round(run.fedSeconds)} s${paused ? ' (paused)' : ''}, ${run.segments.length} segments, level ${avg.toFixed(3)}`);
-    }, 10_000),
-  );
-
-  try {
-    try {
-      await capture.start();
-    } catch (err) {
-      timers.forEach(t => clearTimeout(t));
-      wav?.close();
-      store?.close();
-      finished(false, { error: err.message });
-      throw await run.fail(err);
-    }
-    stateReady = true;
-    writeState();
-    log(`recording "${title}"${duration ? ` for ${duration} s` : ''}; stop with "scriptorium stop" or Ctrl+C`);
-    await stopped;
-    log(`stopping (${stopReason})`);
-    phase = 'finishing';
-    writeState();
-  } finally {
-    timers.forEach(t => clearTimeout(t));
-    await capture.stop();
-    stateReady = false;
-  }
-
-  try {
-    const audio = wav?.close() ?? null;
-    if (audio) run.attachFile('recording', audio.path, { seconds: audio.seconds, sampleRate: 16000, format: 'wav' });
-    log('finishing the transcript');
-    const result = await run.finish();
-    fs.writeFileSync(paths.txt, render(result.segments, 'timed'));
-    run.attachFile('text', paths.txt, { format: 'timed' });
-    result.audioPath = audio?.path ?? null;
-    result.textPath = paths.txt;
-    result.startedAt = startedAt.toISOString();
-    result.pausedSeconds = Math.round((pausedMs + (pausedAt ? Date.now() - pausedAt : 0)) / 1000);
-    result.stopReason = stopReason;
-    deliver(result, opts, { stream, title });
-    // A capture error still saves what was recorded, but the notice should say it went wrong.
-    finished(stopReason !== 'error', {
-      audioPath: result.audioPath,
-      textPath: result.textPath,
-      ...(stopReason === 'error' ? { error: 'audio capture failed; what was recorded until then is saved' } : {}),
-    });
-    if (stopReason === 'error') process.exitCode = 1;
-  } catch (err) {
-    finished(false, { error: err.message });
-    throw await run.fail(err);
-  } finally {
-    fs.rmSync(statePath, { force: true });
-    fs.rmSync(internalStop, { force: true });
-    fs.rmSync(pauseFile, { force: true });
-    if (stopFile) fs.rmSync(stopFile, { force: true });
-    store?.close();
-  }
-}
-
-async function cmdStop(env, opts) {
-  const targets = pickRecordings(runningRecordings(env), opts, 'stop');
-  for (const t of targets) fs.writeFileSync(t.file.replace(/\.json$/, '.stop'), '');
-  if (opts.wait === false) return printJson({ stopping: targets.map(t => t.noteId ?? t.pid) });
-
-  const timeout = (opts.timeout ? parseDuration(opts.timeout) : 600) * 1000;
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline && targets.some(t => fs.existsSync(t.file) && alive(t.pid))) {
-    await new Promise(r => setTimeout(r, 300));
-  }
-  const pending = targets.filter(t => fs.existsSync(t.file) && alive(t.pid));
-  if (pending.length) throw new Error(`Still finalizing after ${timeout / 1000} s: ${pending.map(p => p.noteId).join(', ')}`);
-
-  const store = openStore(env);
-  try {
-    const notes = targets.map(t => {
-      if (!t.noteId) return { pid: t.pid, saved: false };
-      const note = store.getNote(t.noteId);
-      const transcript = store.getTranscript(t.noteId);
-      const segments = transcript ? fromAltEntries(JSON.parse(transcript.content_text || '[]')) : [];
-      return {
-        noteId: note.id,
-        title: note.title,
-        status: note.status,
-        segmentCount: segments.length,
-        audioPath: t.audioPath,
-        textPath: t.textPath ?? null,
-      };
-    });
-    printJson(notes.length === 1 ? notes[0] : notes);
-  } finally {
-    store.close();
-  }
-}
-
-function cmdStatus(env) {
-  const running = runningRecordings(env).map(({ file, ...s }) => ({
-    ...s,
-    elapsedSeconds: Math.round((Date.now() - Date.parse(s.startedAt)) / 1000),
-    recordedSeconds: recordedSeconds(s),
-  }));
-  printJson({ recording: running.length > 0, recordings: running });
-}
-
-// ---- notes / folders / speakers ------------------------------------------------
-
-function noteView(store, id) {
-  const note = store.getNote(id);
-  const components = store.getComponents(id);
-  const transcript = components.find(c => c.component_type === 'transcript');
-  const segments = transcript ? fromAltEntries(JSON.parse(transcript.content_text || '[]')) : [];
-  return {
-    note,
-    speakerNames: transcript?.metadata?.speakerNames ?? {},
-    files: components.filter(c => c.file_path).map(c => ({ type: c.component_type, path: c.file_path, ...c.metadata })),
-    segments,
-  };
-}
-
-function cmdNotes(env, opts, [sub, ...rest]) {
-  const store = openStore(env);
-  try {
-    switch (sub) {
-      case 'list': {
-        const folderId = opts.folder === undefined ? undefined : store.resolveFolder(opts.folder)?.id ?? null;
-        return printJson(store.listNotes({ folderId, search: opts.search, limit: opts.limit ? Number(opts.limit) : 50 }));
-      }
-      case 'show':
-      case 'export': {
-        if (!rest[0]) throw new UsageError(`notes ${sub} needs a note id`);
-        const view = noteView(store, rest[0]);
-        if (sub === 'export' && !opts.out) throw new UsageError('notes export needs --out <file>');
-        const fmt = formatFor(opts, opts.out);
-        const text = render(view.segments, fmt, { speakerNames: view.speakerNames, title: view.note.title });
-        if (opts.out) {
-          fs.writeFileSync(opts.out, text);
-          return printJson({ saved: path.resolve(opts.out), format: fmt, segments: view.segments.length });
-        }
-        if (opts.format) return process.stdout.write(text);
-        return printJson(view);
-      }
-      case 'rename':
-        if (!rest[0] || rest[1] === undefined) throw new UsageError('notes rename <noteId> <title>');
-        return printJson(store.updateNote(rest[0], { title: rest[1] }));
-      case 'move': {
-        if (!rest[0] || rest[1] === undefined) throw new UsageError('notes move <noteId> <folder|null>');
-        const folder = store.resolveFolder(rest[1]);
-        return printJson(store.updateNote(rest[0], { folder_id: folder?.id ?? null }));
-      }
-      case 'delete': {
-        if (!rest[0]) throw new UsageError('notes delete <noteId>');
-        const files = store.deleteNote(rest[0]);
-        // Only remove recordings and transcripts scriptorium itself made in its own folders.
-        const own = [env.recordingsDir, outputDir(opts)];
-        const removed = opts['keep-audio'] ? [] : files.filter(f => isOwnFile(f, own) && fs.existsSync(f));
-        removed.forEach(f => fs.rmSync(f, { force: true }));
-        return printJson({ deleted: rest[0], removedFiles: removed });
-      }
-      default:
-        throw new UsageError('notes list|show|export|rename|move|delete');
-    }
-  } finally {
-    store.close();
-  }
-}
-
-function cmdFolders(env, opts, [sub, ...rest]) {
-  const store = openStore(env);
-  try {
-    switch (sub) {
-      case 'list':
-        return printJson(store.listFolders());
-      case 'create':
-        if (!rest[0]) throw new UsageError('folders create <name>');
-        return printJson(store.createFolder(rest[0], opts.parent || null));
-      case 'delete':
-        if (!rest[0]) throw new UsageError('folders delete <id>');
-        store.deleteFolder(store.resolveFolder(rest[0]).id);
-        return printJson({ deleted: rest[0] });
-      default:
-        throw new UsageError('folders list|create|delete');
-    }
-  } finally {
-    store.close();
-  }
-}
-
-function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
-  if (sub !== 'rename' || !noteId || !speaker || name === undefined)
-    throw new UsageError('speakers rename <noteId> <SPEAKER_00> <name>');
-  const store = openStore(env);
-  try {
-    const t = store.getTranscript(noteId);
-    if (!t) throw new UsageError(`Note ${noteId} has no transcript`);
-    const speakerNames = { ...(t.metadata?.speakerNames || {}), [speaker]: name };
-    store.updateComponent(t.id, { metadata: { ...(t.metadata || {}), speakerNames } });
-    printJson({ noteId, speakerNames, rewritten: rewriteTextFiles(store, noteId) });
-  } finally {
-    store.close();
-  }
-}
-
-/**
- * Writes the note's saved transcript files (the .txt next to a recording) again from the stored
- * transcript, e.g. after a speaker was named. Returns the files written; a missing file is left
- * missing (the user deleted or moved it).
- */
-function rewriteTextFiles(store, noteId) {
-  const view = noteView(store, noteId);
-  const written = [];
-  for (const c of store.getComponents(noteId)) {
-    if (c.component_type !== 'text' || !c.file_path || !fs.existsSync(c.file_path)) continue;
-    fs.writeFileSync(c.file_path, render(view.segments, c.metadata?.format || 'timed', { speakerNames: view.speakerNames }));
-    written.push(c.file_path);
-  }
-  return written;
-}
-
-// ---- app ---------------------------------------------------------------------
-
-/** Runs work with the tray app kept running, so its icon shows however the work was started. */
-async function withTrayApp(env, work) {
-  const stop = keepTrayApp(env);
-  try {
-    return await work();
-  } finally {
-    stop();
-  }
-}
-
-/**
- * Starts the tray app, or brings the running one forward (it allows one instance per session).
- * The app watches env.dataDir, so a --data-dir given here reaches it too.
- */
-async function cmdApp(env) {
-  if (!fs.existsSync(env.appExe)) {
-    throw new Error(`The tray app is missing: ${env.appExe}. Build it with scripts\\build-app.cmd.`);
-  }
-  const child = spawn(env.appExe, ['--data-dir', env.dataDir], { detached: true, stdio: 'ignore' });
-  // e.g. blocked by an application control policy: report it rather than print a pid
-  await new Promise((resolve, reject) => {
-    child.once('spawn', resolve);
-    child.once('error', e => reject(new Error(`Could not start the tray app ${env.appExe}: ${e.message}`)));
-  });
-  child.unref();
-  printJson({ app: env.appExe, pid: child.pid });
-}
-
-// ---- setup -------------------------------------------------------------------
-
-function cmdDevices(env) {
-  printJson({ audio: listDevices(env) });
-}
-
-function cmdDoctor(env) {
-  const checks = checkRequired(env, { diarize: true });
-  let audio = null;
-  try {
-    const devices = listDevices(env);
-    audio = {
-      microphone: devices.find(d => d.input && d.default)?.name ?? null,
-      output: devices.find(d => d.output && d.default)?.name ?? null,
-    };
-  } catch (e) {
-    audio = { error: e.message };
-  }
-  let speech = null;
-  try {
-    require('sherpa-onnx-node');
-    speech = { ok: true };
-  } catch (e) {
-    speech = { error: e.message };
-  }
-  const ok = checks.every(c => c.ok) && !audio.error && !speech.error;
-  printJson({
-    ok,
-    version: VERSION,
-    engine: { native: env.nativeDir, gpuBuild: env.gpuBuild },
-    dataDir: env.dataDir,
-    audio,
-    speechModules: speech,
-    checks,
-  });
-  if (!ok) process.exitCode = 1;
-}
-
-// ---- main ----------------------------------------------------------------------
-
 const COMMANDS = {
   transcribe: { values: TRANSCRIBE_VALUES, booleans: TRANSCRIBE_BOOLEANS },
   record: {
-    values: [...TRANSCRIBE_VALUES, 'duration', 'mic', 'stop-file', 'audio-out', 'output-dir'],
-    booleans: [...TRANSCRIBE_BOOLEANS, 'system', 'audio', 'detach', 'overwrite'],
+    values: [...TRANSCRIBE_VALUES, 'duration', 'mic', 'audio-out'],
+    booleans: [...TRANSCRIBE_BOOLEANS, 'system', 'audio', 'detach'],
   },
   stop: { values: ['id', 'timeout'], booleans: ['wait', 'all'] },
   pause: { values: ['id'], booleans: ['all'] },
   resume: { values: ['id'], booleans: ['all'] },
   status: {},
-  notes: { values: ['folder', 'search', 'limit', 'format', 'out', 'output-dir'], booleans: ['keep-audio'] },
-  folders: { values: ['parent'] },
+  notes: { values: ['search', 'limit', 'format', 'out', 'output-dir'], booleans: ['keep-files', 'keep-audio'] },
   speakers: {},
   app: {},
   devices: {},
-  doctor: {},
+  doctor: { values: ['output-dir'] },
   'setup-claude': { values: ['config'], booleans: ['remove', 'if-own', 'dry-run'] },
   mcp: {},
 };
@@ -929,16 +145,13 @@ async function main(argv = process.argv.slice(2)) {
         break;
       case 'pause':
       case 'resume':
-        await cmdPause(env, opts, command === 'pause');
+        printJson(await setPaused(env, opts, command === 'pause'));
         break;
       case 'status':
-        cmdStatus(env);
+        printJson(recordingStatus(env));
         break;
       case 'notes':
         cmdNotes(env, opts, positionals);
-        break;
-      case 'folders':
-        cmdFolders(env, opts, positionals);
         break;
       case 'speakers':
         cmdSpeakers(env, opts, positionals);
@@ -950,7 +163,7 @@ async function main(argv = process.argv.slice(2)) {
         cmdDevices(env);
         break;
       case 'doctor':
-        cmdDoctor(env);
+        cmdDoctor(env, opts);
         break;
       case 'setup-claude':
         printJson(

@@ -81,6 +81,62 @@ test('record exits with code 3 before starting anything when the title is taken'
   fs.rmSync(out, { recursive: true, force: true });
 });
 
+test('transcribe checks every transcript name before starting, with the same exit code 3', () => {
+  const data = tmp('scriptorium-data-');
+  const out = tmp('scriptorium-out-');
+  const a = path.join(data, '강의.m4a');
+  const b = path.join(data, '회의.m4a');
+  fs.writeFileSync(a, '');
+  fs.writeFileSync(b, '');
+  fs.writeFileSync(path.join(out, '회의.txt'), 'old');
+  const r = cli(['transcribe', a, b, '--data-dir', data], { SCRIPTORIUM_OUTPUT: out });
+  assert.equal(r.status, NAME_TAKEN_EXIT, r.stderr);
+  assert.match(r.stderr, /"회의" already exists/);
+  assert.equal(fs.existsSync(path.join(out, '강의.txt')), false, 'nothing started');
+  fs.rmSync(data, { recursive: true, force: true });
+  fs.rmSync(out, { recursive: true, force: true });
+});
+
+test('a run writes its transcript file on every save, and removes it when nothing was transcribed', async () => {
+  const { TranscriptionRun } = require('../src/transcriber');
+  const dir = tmp('scriptorium-run-');
+  const txt = path.join(dir, 't.txt');
+  const run = new TranscriptionRun({ env: {}, store: null, note: { title: 't', type: 'recording' }, options: {}, log: () => {}, textPath: txt });
+  run.segments = [{ start: 61000, end: 62000, text: '중간 저장' }];
+  run.save();
+  assert.equal(fs.readFileSync(txt, 'utf8'), '(01:01)\n중간 저장\n');
+  run.segments = [];
+  await run.fail(new Error('x'));
+  assert.equal(fs.existsSync(txt), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('segments over digital silence are dropped, speech is kept', () => {
+  const { mapSegments, quietShare, SR } = require('../src/speech');
+  const audio = new Float32Array(SR * 4);
+  for (let i = 0; i < SR * 2; i++) audio[i] = 0.1 * Math.sin(i / 5);  // 0-2 s: sound, 2-4 s: silence
+  assert.equal(quietShare(audio, 0, 2000), 0);
+  assert.equal(quietShare(audio, 2000, 4000), 1);
+  const pieces = [{ chunkStart: 0, origStart: 0, length: audio.length }];
+  const reply = { segments: [{ start: 0, end: 2000, text: '실제 말' }, { start: 2100, end: 3900, text: '감사합니다.' }] };
+  assert.deepEqual(mapSegments(reply, pieces, audio).map(s => s.text), ['실제 말']);
+  assert.equal(mapSegments(reply, pieces).length, 2, 'without audio nothing changes');
+});
+
+test('whisper threads are shared with the work already running', () => {
+  const { autoThreads } = require('../src/commands/common');
+  const data = tmp('scriptorium-data-');
+  const run = path.join(data, 'run');
+  fs.mkdirSync(run);
+  const env = { runDir: run };
+  assert.equal(autoThreads(env, 16), 16);
+  // two live recorders (this process stands in for both)
+  for (const id of ['a', 'b']) fs.writeFileSync(path.join(run, `recording-${id}.json`), JSON.stringify({ pid: process.pid }));
+  assert.equal(autoThreads(env, 16), 5);
+  assert.equal(autoThreads(env, 4), 2, 'never below 2');
+  fs.rmSync(data, { recursive: true, force: true });
+});
+
 test('naming a speaker rewrites the saved transcript file', () => {
   const data = tmp('scriptorium-data-');
   const store = new Store(path.join(data, 'scriptorium.db'));

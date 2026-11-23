@@ -20,7 +20,8 @@ const {
   assignSpeakers,
   concat,
 } = require('./speech');
-const { toAltEntries } = require('./format');
+const fs = require('node:fs');
+const { toAltEntries, render } = require('./format');
 
 const SAVE_EVERY_MS = 2000;
 /** Live: a chunk goes out at a pause once it holds this much speech... */
@@ -37,13 +38,14 @@ class TranscriptionRun {
    * @param {object} p
    * @param {object} p.env
    * @param {import('./store').Store|null} p.store   null with --no-save
-   * @param {object} p.note     { title, type: 'file'|'recording', folderId, sourcePath }
+   * @param {object} p.note     { title, type: 'file'|'recording', sourcePath }
    * @param {object} p.options  { language, diarize, speakers, prompt, threads, beam, useGpu, gpu }
    * @param {(msg: string) => void} p.log
    * @param {(event: object) => void} [p.onEvent]
+   * @param {string|null} [p.textPath]  the "(mm:ss)" transcript file, rewritten on every save
    */
-  constructor({ env, store, note, options, log, onEvent }) {
-    Object.assign(this, { env, store, noteSpec: note, options, log, onEvent: onEvent || (() => {}) });
+  constructor({ env, store, note, options, log, onEvent, textPath = null }) {
+    Object.assign(this, { env, store, noteSpec: note, options, log, onEvent: onEvent || (() => {}), textPath });
     this.live = note.type === 'recording';
     this.segments = [];
     this.sent = [];
@@ -71,7 +73,6 @@ class TranscriptionRun {
       this.note = this.store.createNote({
         title: this.noteSpec.title,
         type: this.noteSpec.type,
-        folderId: this.noteSpec.folderId ?? null,
         sourcePath: this.noteSpec.sourcePath ?? null,
         status: this.live ? 'recording' : 'processing',
       });
@@ -111,7 +112,7 @@ class TranscriptionRun {
     const job = this.whisper
       .transcribe(chunk.audio, chunk.retry ? { language: 'auto' } : {})
       .then(reply => {
-        let segs = mapSegments(reply, chunk.pieces);
+        let segs = mapSegments(reply, chunk.pieces, chunk.audio);
         if (chunk.retry) {
           const mainLang = this.options.language || this.language;
           segs = segs.filter(s => !isDuplicate(s, this.segments) && keepRetrySegment(s, reply.lang, mainLang));
@@ -132,7 +133,7 @@ class TranscriptionRun {
           }
         }
         this.emitChanges();
-        if (this.store && Date.now() - this.lastSave > SAVE_EVERY_MS) this.save();
+        if ((this.store || this.textPath) && Date.now() - this.lastSave > SAVE_EVERY_MS) this.save();
       })
       .catch(err => {
         this.error = this.error || err;
@@ -169,9 +170,25 @@ class TranscriptionRun {
 
   save(final = false) {
     this.lastSave = Date.now();
+    this.writeText();
     if (!this.store || !this.transcript) return;
     this.store.updateComponent(this.transcript.id, { contentText: JSON.stringify(toAltEntries(this.publicSegments())) });
     if (final) this.store.updateNote(this.note.id, { status: 'completed' });
+  }
+
+  /**
+   * Writes the transcript file. A failure (the file opened with a lock, a full disk) is logged
+   * once and does not stop the run: the note in the database still has everything.
+   */
+  writeText() {
+    if (!this.textPath) return;
+    try {
+      fs.writeFileSync(this.textPath, render(this.publicSegments(), 'timed'));
+      this.textWarned = false;
+    } catch (e) {
+      if (!this.textWarned) this.log(`warning: could not write ${this.textPath}: ${e.message}`);
+      this.textWarned = true;
+    }
   }
 
   attachFile(type, filePath, metadata) {
@@ -226,6 +243,8 @@ class TranscriptionRun {
     clearInterval(this.liveTimer);
     try {
       this.save();
+      // nothing was transcribed: leave no empty transcript file behind
+      if (this.textPath && !this.segments.length) fs.rmSync(this.textPath, { force: true });
       if (this.store && this.note) this.store.updateNote(this.note.id, { status: 'failed' });
     } catch {
       /* best effort */

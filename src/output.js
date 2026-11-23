@@ -1,7 +1,8 @@
 'use strict';
-// Where a recording's files go and what they are called. A recording titled "알고리즘 1주차" is
-// saved as Documents\Scriptorium\알고리즘 1주차.wav with its transcript next to it as
-// 알고리즘 1주차.txt. A name that is taken is not overwritten unless asked (--overwrite).
+// Where recordings and transcripts go and what they are called. A recording titled "알고리즘 1주차"
+// is saved as Documents\Scriptorium\알고리즘 1주차.wav with its transcript next to it as
+// 알고리즘 1주차.txt; a transcribed file gets just the .txt. A name that is taken is not
+// overwritten unless asked (--overwrite).
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -87,7 +88,12 @@ function recordingPaths({ dir, title, audioOut = null, audio = true }) {
   return { base, wav: audio ? (audioOut ? path.resolve(audioOut) : `${base}.wav`) : null, txt: `${base}.txt` };
 }
 
-const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+/** The transcript file of a file transcription titled `title`. */
+function textPathFor(dir, title) {
+  return path.join(dir, `${safeFileName(title)}.txt`);
+}
+
+const samePath =(a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 
 /**
  * What already holds a recording's names: existing files, or another running recording that will
@@ -133,6 +139,7 @@ module.exports = {
   safeFileName,
   defaultTitle,
   recordingPaths,
+  textPathFor,
   takenNames,
   checkNames,
   isOwnFile,
