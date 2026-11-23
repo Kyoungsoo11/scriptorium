@@ -90,13 +90,23 @@ function render(segments, fmt, { speakerNames = {}, title = 'Transcript' } = {})
       }
       return `${lines.join('\n').trimEnd()}\n`;
     }
+    case 'timed': {
+      // The transcript saved next to a recording: "(mm:ss)" then the sentence, a blank line between.
+      // Speakers are named only when there are two or more; one voice needs no label.
+      const many = new Set(segments.map(s => s.speaker).filter(Boolean)).size > 1;
+      const blocks = segments.map(s => {
+        const who = many ? label(s, speakerNames) : null;
+        return `(${shortClock(s.start)})${who ? ` ${who}` : ''}\n${s.text.trim()}`;
+      });
+      return blocks.length ? `${blocks.join('\n\n')}\n` : '';
+    }
     case 'json':
       return `${JSON.stringify(segments, null, 2)}\n`;
     default:
-      throw new Error(`Unknown format ${fmt} (json, srt, vtt, txt, md)`);
+      throw new Error(`Unknown format ${fmt} (${FORMATS.join(', ')})`);
   }
 }
 
-const FORMATS = ['json', 'srt', 'vtt', 'txt', 'md'];
+const FORMATS = ['json', 'srt', 'vtt', 'txt', 'md', 'timed'];
 
 module.exports = { toAltEntries, fromAltEntries, render, clock, FORMATS };

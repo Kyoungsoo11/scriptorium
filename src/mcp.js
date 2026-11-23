@@ -28,7 +28,11 @@ const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this comp
   status is "done", then read the note with scriptorium_get_transcript.
 - Record: scriptorium_start_recording (microphone + computer audio by default; mic "none" = computer audio
   only, e.g. an online lecture), later scriptorium_stop_recording. Stopping finishes the transcript, which
-  can take a few minutes for long recordings.
+  can take a few minutes for long recordings. scriptorium_pause_recording / scriptorium_resume_recording
+  leave the paused time out of the recording.
+- A recording is saved as <title>.wav plus <title>.txt (the transcript) in Documents\\Scriptorium. If that
+  name is taken, start_recording fails; ask the user for another title, or pass overwrite: true only when
+  they agree to replace the old files.
 - Transcripts are long: read them in pages with offset/maxChars, or export to a file.
 - Speakers are SPEAKER_00, SPEAKER_01, ...; name them with scriptorium_rename_speaker. If the user knows how
   many people spoke, pass speakers (it is more accurate than the estimate).
@@ -77,11 +81,26 @@ const TOOLS = [
       properties: {
         mic: str('"default" (default), "none" for computer audio only, or a device id from scriptorium_list_devices.'),
         systemAudio: { type: 'boolean', description: 'Also capture what the computer plays (default true).' },
-        duration: str('Stop automatically after this long, e.g. "50m", "1h30m". Omit to record until stopped.'),
+        duration: str('Stop automatically after this much recorded time, e.g. "50m", "1h30m". Omit to record until stopped.'),
+        overwrite: { type: 'boolean', description: 'Replace existing <title>.wav/.txt files (default false: fail if the name is taken).' },
         ...TRANSCRIBE_PROPS,
       },
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'scriptorium_pause_recording',
+    title: 'Pause a recording',
+    description: 'Pauses a running recording; nothing is recorded until scriptorium_resume_recording, and the paused time is left out of the file and the transcript times.',
+    inputSchema: { type: 'object', properties: { noteId: str('Recording to pause; may be omitted when only one is running.') } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'scriptorium_resume_recording',
+    title: 'Resume a recording',
+    description: 'Resumes a paused recording.',
+    inputSchema: { type: 'object', properties: { noteId: str('Recording to resume; may be omitted when only one is running.') } },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
   {
     name: 'scriptorium_stop_recording',
@@ -148,7 +167,7 @@ const TOOLS = [
   {
     name: 'scriptorium_rename_speaker',
     title: 'Name a speaker',
-    description: 'Gives a speaker label (e.g. SPEAKER_00) a display name in one note.',
+    description: 'Gives a speaker label (e.g. SPEAKER_00) a display name in one note, and rewrites the note\'s saved .txt transcript with the new name.',
     inputSchema: {
       type: 'object',
       properties: { noteId: str('Note id.'), speaker: str('Label such as SPEAKER_00.'), name: str('Display name.') },
@@ -341,7 +360,14 @@ async function callTool(env, name, a = {}) {
       if (a.mic) args.push('--mic', String(a.mic));
       if (a.systemAudio === false) args.push('--no-system');
       if (a.duration) args.push('--duration', String(a.duration));
+      if (a.overwrite === true) args.push('--overwrite');
       return cliJson(args, { timeoutMs: 120000 });
+    }
+    case 'scriptorium_pause_recording':
+    case 'scriptorium_resume_recording': {
+      const args = [name === 'scriptorium_pause_recording' ? 'pause' : 'resume'];
+      if (a.noteId) args.push('--id', String(a.noteId));
+      return cliJson(args);
     }
     case 'scriptorium_stop_recording': {
       const args = ['stop', '--timeout', `${STOP_WAIT_S}s`];

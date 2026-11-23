@@ -1,7 +1,7 @@
 'use strict';
 // scriptorium: non-interactive CLI. Every command runs to completion from its options alone,
 // prints one JSON result on stdout (or the requested transcript format), logs on stderr,
-// and exits 0 on success, 1 on failure, 2 on bad usage.
+// and exits 0 on success, 1 on failure, 2 on bad usage, 3 when a recording's file name is taken.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -16,6 +16,7 @@ const { TranscriptionRun } = require('./transcriber');
 const { render, fromAltEntries, FORMATS } = require('./format');
 const { writeJsonAtomic, writeFinished, TranscribeState } = require('./activity');
 const { keepTrayApp } = require('./tray');
+const { outputDir, recordingPaths, checkNames, takenNames, defaultTitle, isOwnFile } = require('./output');
 
 const VERSION = require('../package.json').version;
 
@@ -32,11 +33,13 @@ Transcription
   transcribe <file> [<file> ...]   transcribe audio/video files
   record                           record microphone + system audio and transcribe live
   stop [--id <noteId>]             stop a running recording and wait for its result
+  pause [--id <noteId>]            pause a recording (the paused time is left out)
+  resume [--id <noteId>]           resume a paused recording
   status                           show running recordings
 
 Notes
   notes list [--folder <name|id|null>] [--search <text>] [--limit <n>]
-  notes show <noteId> [--format json|srt|vtt|txt|md]
+  notes show <noteId> [--format json|srt|vtt|txt|md|timed]
   notes export <noteId> --format <fmt> --out <file>
   notes rename <noteId> <title>
   notes move <noteId> <folder|null>
@@ -67,19 +70,25 @@ Transcription options (transcribe, record)
   --title <text>          note title (default: file name / date)
   --folder <name|id>      put the note in a folder (created if missing)
   --no-save               do not store a note, only print the result
-  --format <fmt>          print the transcript as json|srt|vtt|txt|md instead of the result JSON
+  --format <fmt>          print the transcript as json|srt|vtt|txt|md|timed instead of the result JSON
   --out <file>            write the transcript to a file (format from --format or extension)
   --stream                print JSON lines while running: started, segment..., done
 
 Record options
-  --duration <time>       stop after e.g. 90s, 45m, 1h30m (default: until stopped)
+  A recording is saved as <title>.wav with its transcript <title>.txt ("(mm:ss)" then the text)
+  in Documents\\Scriptorium. Without --title the title is the start time, e.g. "2026-11-23 14-30".
+  --duration <time>       stop after e.g. 90s, 45m, 1h30m of recorded time (default: until stopped)
   --mic <id|default|none> microphone (default: system default; none = system audio only)
   --no-system             do not capture system audio (microphone only)
   --stop-file <path>      stop when this file appears
-  --audio-out <file.wav>  where to keep the recording (default: in the data folder)
-  --no-audio              do not keep the recording
+  --output-dir <dir>      folder for the .wav and .txt (default Documents\\Scriptorium,
+                          or SCRIPTORIUM_OUTPUT)
+  --overwrite             replace an existing <title>.wav/.txt (otherwise: exit code 3)
+  --audio-out <file.wav>  save the recording here instead (the .txt goes next to it)
+  --no-audio              do not keep the recording (the .txt is still written)
   --detach                start in the background, print the note id and return
   Stops on: --duration, --stop-file, "scriptorium stop", Ctrl+C.
+  Pauses with "scriptorium pause" until "scriptorium resume".
 
 Global options
   --data-dir <dir>        notes database and recordings (default %USERPROFILE%\\.scriptorium)
@@ -294,6 +303,68 @@ function runningRecordings(env) {
   });
 }
 
+/** Seconds actually recorded so far (pauses left out), from a recording's state file. */
+function recordedSeconds(s, now = Date.now()) {
+  const paused = (s.pausedMs || 0) + (s.paused && s.pausedAt ? now - Date.parse(s.pausedAt) : 0);
+  return Math.max(0, Math.round((now - Date.parse(s.startedAt) - paused) / 1000));
+}
+
+/**
+ * Title and file paths of a new recording. A given --title must be free (or --overwrite); the
+ * default title (the start time) takes the next free "title (2)", "title (3)", ...
+ */
+function recordingTarget(env, opts, startedAt) {
+  const dir = outputDir(opts);
+  const running = runningRecordings(env);
+  const make = title => ({
+    title,
+    paths: recordingPaths({ dir, title, audioOut: opts['audio-out'], audio: opts.audio !== false }),
+  });
+  if (opts.title || opts['audio-out']) {
+    const target = make(opts.title || path.parse(opts['audio-out']).name);
+    checkNames(target.paths, running, { overwrite: opts.overwrite });
+    return target;
+  }
+  const base = defaultTitle(startedAt);
+  for (let n = 1; ; n++) {
+    const target = make(n === 1 ? base : `${base} (${n})`);
+    if (!takenNames(target.paths, running).length) return target;
+  }
+}
+
+/** Finds the running recordings `pause`/`resume`/`stop` act on: --id, --all, or the only one. */
+function pickRecordings(running, opts, verb) {
+  if (opts.id) {
+    const found = running.filter(s => s.noteId === opts.id || String(s.pid) === opts.id);
+    if (!found.length) throw new UsageError(`No running recording ${opts.id}`);
+    return found;
+  }
+  if (!running.length) throw new UsageError('No recording is running');
+  if (!opts.all && running.length > 1)
+    throw new UsageError(`${running.length} recordings are running; pass --id <noteId> or --all to ${verb}`);
+  return running;
+}
+
+/** `pause` / `resume`: the recorder polls recording-<id>.pause every 250 ms. */
+async function cmdPause(env, opts, pause) {
+  const targets = pickRecordings(runningRecordings(env), opts, pause ? 'pause' : 'resume');
+  for (const t of targets) {
+    const file = t.file.replace(/\.json$/, '.pause');
+    if (pause) fs.writeFileSync(file, '');
+    else fs.rmSync(file, { force: true });
+  }
+  // wait (briefly) until each recorder says so in its state file
+  const deadline = Date.now() + 3000;
+  let states = targets;
+  while (Date.now() < deadline) {
+    states = targets.map(t => stateFiles(env).find(s => s.file === t.file) ?? t);
+    if (states.every(s => Boolean(s.paused) === pause || !alive(s.pid))) break;
+    await new Promise(r => setTimeout(r, 150));
+  }
+  const out = states.map(s => ({ noteId: s.noteId, title: s.title, paused: Boolean(s.paused), recordedSeconds: recordedSeconds(s) }));
+  printJson(out.length === 1 ? out[0] : out);
+}
+
 async function cmdRecordDetached(env, opts, argv) {
   // Check the options here, so a mistake is reported directly instead of as "did not start".
   const options = transcriptionOptions(opts);
@@ -305,6 +376,8 @@ async function cmdRecordDetached(env, opts, argv) {
     }
   }
   if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
+  // A taken name is reported here (exit 3), not as "the recorder did not start".
+  recordingTarget(env, opts, new Date());
   requireModels(env, options);
   fs.mkdirSync(env.runDir, { recursive: true });
   const logFile = opts['log-file'] ? path.resolve(opts['log-file']) : path.join(env.runDir, `record-${Date.now()}.log`);
@@ -362,13 +435,14 @@ async function cmdRecord(env, opts, argv) {
   const duration = opts.duration ? parseDuration(opts.duration) : null;
   const stopFile = opts['stop-file'] ? path.resolve(opts['stop-file']) : null;
   if (stopFile && fs.existsSync(stopFile)) throw new UsageError(`--stop-file ${stopFile} already exists; remove it first`);
+  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
+  const startedAt = new Date();
+  // Checked before anything starts, so a taken name costs nothing.
+  const { title, paths } = recordingTarget(env, opts, startedAt);
   const store = opts.save === false ? null : openStore(env);
   const folder = store ? store.resolveFolder(opts.folder, { create: true }) : null;
   const stream = streamer(opts);
-  const startedAt = new Date();
-  const title = opts.title || `Recording ${startedAt.toLocaleString('sv-SE').slice(0, 16)}`;
 
-  if (opts.mic === 'none' && opts.system === false) throw new UsageError('Nothing to record: --mic none with --no-system');
   const capture = new Capture(env, { mic: opts.mic || 'default', system: opts.system !== false });
   const run = new TranscriptionRun({
     env,
@@ -384,12 +458,11 @@ async function cmdRecord(env, opts, argv) {
   const id = run.note?.id ?? `nosave-${process.pid}`;
   const statePath = path.join(env.runDir, `recording-${id}.json`);
   const internalStop = path.join(env.runDir, `recording-${id}.stop`);
+  const pauseFile = path.join(env.runDir, `recording-${id}.pause`);
+  fs.rmSync(pauseFile, { force: true });
+  fs.mkdirSync(path.dirname(paths.txt), { recursive: true });
   let wav = null;
-  if (opts.audio !== false) {
-    const wavPath = opts['audio-out'] ? path.resolve(opts['audio-out']) : path.join(env.recordingsDir, `${id}.wav`);
-    fs.mkdirSync(path.dirname(wavPath), { recursive: true });
-    wav = new WavWriter(wavPath);
-  }
+  if (paths.wav) wav = new WavWriter(paths.wav);
 
   let stopReason = null;
   let resolveStop;
@@ -401,8 +474,16 @@ async function cmdRecord(env, opts, argv) {
     }
   };
 
+  // Pausing cuts the paused span out: nothing reaches the wav or the recognizer, so the file and
+  // the transcript times count recorded time only.
+  let paused = false;
+  let pausedAt = null;
+  let pausedMs = 0;
+  let lastText = '';
+
   let level = { sum: 0, n: 0 };
   capture.on('data', samples => {
+    if (paused) return;
     wav?.write(samples);
     run.feed(samples);
     level.sum += rms(samples);
@@ -434,7 +515,13 @@ async function cmdRecord(env, opts, argv) {
       noteId: run.note?.id ?? null,
       title,
       startedAt: startedAt.toISOString(),
+      // recorded time = now - startedAt - pausedMs - (now - pausedAt while paused)
+      paused,
+      pausedAt: pausedAt ? new Date(pausedAt).toISOString() : null,
+      pausedMs,
       audioPath: wav?.file ?? null,
+      textPath: paths.txt,
+      lastText,
       stopFile,
       duration,
       audio: audioState,
@@ -442,6 +529,17 @@ async function cmdRecord(env, opts, argv) {
     });
   const finished = (ok, extra) =>
     writeFinished(env, { kind: 'recording', id, title, ok, noteId: run.note?.id ?? null, ...extra });
+  const setPaused = want => {
+    if (want === paused || phase !== 'recording') return;
+    paused = want;
+    if (want) pausedAt = Date.now();
+    else {
+      pausedMs += Date.now() - pausedAt;
+      pausedAt = null;
+    }
+    log(want ? 'paused' : 'resumed');
+    writeState();
+  };
   capture.on('started', msg => {
     audioState.microphoneMuted = msg.microphoneMuted ?? null;
     for (const w of audioWarnings(audioState)) log(`warning: ${w}`);
@@ -466,17 +564,29 @@ async function cmdRecord(env, opts, argv) {
   process.on('SIGTERM', onSignal);
   process.on('SIGBREAK', onSignal);
   const timers = [];
-  if (duration) timers.push(setTimeout(() => stop('duration'), duration * 1000));
   timers.push(
     setInterval(() => {
       if (fs.existsSync(internalStop) || (stopFile && fs.existsSync(stopFile))) stop('stop-file');
+      setPaused(fs.existsSync(pauseFile));
+      // --duration counts recorded time, so a pause does not eat into it
+      if (duration && run.fedSeconds >= duration) stop('duration');
     }, 250),
+  );
+  timers.push(
+    setInterval(() => {
+      const last = run.segments[run.segments.length - 1];
+      const text = last ? last.text.trim().slice(0, 300) : '';
+      if (text !== lastText) {
+        lastText = text;
+        writeState();
+      }
+    }, 1000),
   );
   timers.push(
     setInterval(() => {
       const avg = level.n ? level.sum / level.n : 0;
       level = { sum: 0, n: 0 };
-      log(`recording ${Math.round(run.fedSeconds)} s, ${run.segments.length} segments, level ${avg.toFixed(3)}`);
+      log(`recording ${Math.round(run.fedSeconds)} s${paused ? ' (paused)' : ''}, ${run.segments.length} segments, level ${avg.toFixed(3)}`);
     }, 10_000),
   );
 
@@ -508,13 +618,18 @@ async function cmdRecord(env, opts, argv) {
     if (audio) run.attachFile('recording', audio.path, { seconds: audio.seconds, sampleRate: 16000, format: 'wav' });
     log('finishing the transcript');
     const result = await run.finish();
+    fs.writeFileSync(paths.txt, render(result.segments, 'timed'));
+    run.attachFile('text', paths.txt, { format: 'timed' });
     result.audioPath = audio?.path ?? null;
+    result.textPath = paths.txt;
     result.startedAt = startedAt.toISOString();
+    result.pausedSeconds = Math.round((pausedMs + (pausedAt ? Date.now() - pausedAt : 0)) / 1000);
     result.stopReason = stopReason;
     deliver(result, opts, { stream, title });
     // A capture error still saves what was recorded, but the notice should say it went wrong.
     finished(stopReason !== 'error', {
       audioPath: result.audioPath,
+      textPath: result.textPath,
       ...(stopReason === 'error' ? { error: 'audio capture failed; what was recorded until then is saved' } : {}),
     });
     if (stopReason === 'error') process.exitCode = 1;
@@ -524,18 +639,14 @@ async function cmdRecord(env, opts, argv) {
   } finally {
     fs.rmSync(statePath, { force: true });
     fs.rmSync(internalStop, { force: true });
+    fs.rmSync(pauseFile, { force: true });
     if (stopFile) fs.rmSync(stopFile, { force: true });
     store?.close();
   }
 }
 
 async function cmdStop(env, opts) {
-  const running = runningRecordings(env);
-  let targets = running;
-  if (opts.id) targets = running.filter(s => s.noteId === opts.id || String(s.pid) === opts.id);
-  else if (!opts.all && running.length > 1)
-    throw new UsageError(`${running.length} recordings are running; pass --id <noteId> or --all`);
-  if (targets.length === 0) throw new UsageError(opts.id ? `No running recording ${opts.id}` : 'No recording is running');
+  const targets = pickRecordings(runningRecordings(env), opts, 'stop');
   for (const t of targets) fs.writeFileSync(t.file.replace(/\.json$/, '.stop'), '');
   if (opts.wait === false) return printJson({ stopping: targets.map(t => t.noteId ?? t.pid) });
 
@@ -554,7 +665,14 @@ async function cmdStop(env, opts) {
       const note = store.getNote(t.noteId);
       const transcript = store.getTranscript(t.noteId);
       const segments = transcript ? fromAltEntries(JSON.parse(transcript.content_text || '[]')) : [];
-      return { noteId: note.id, title: note.title, status: note.status, segmentCount: segments.length, audioPath: t.audioPath };
+      return {
+        noteId: note.id,
+        title: note.title,
+        status: note.status,
+        segmentCount: segments.length,
+        audioPath: t.audioPath,
+        textPath: t.textPath ?? null,
+      };
     });
     printJson(notes.length === 1 ? notes[0] : notes);
   } finally {
@@ -566,6 +684,7 @@ function cmdStatus(env) {
   const running = runningRecordings(env).map(({ file, ...s }) => ({
     ...s,
     elapsedSeconds: Math.round((Date.now() - Date.parse(s.startedAt)) / 1000),
+    recordedSeconds: recordedSeconds(s),
   }));
   printJson({ recording: running.length > 0, recordings: running });
 }
@@ -618,10 +737,9 @@ function cmdNotes(env, opts, [sub, ...rest]) {
       case 'delete': {
         if (!rest[0]) throw new UsageError('notes delete <noteId>');
         const files = store.deleteNote(rest[0]);
-        // Only remove recordings scriptorium itself made inside its data folder.
-        const removed = opts['keep-audio']
-          ? []
-          : files.filter(f => path.resolve(f).startsWith(env.recordingsDir + path.sep) && fs.existsSync(f));
+        // Only remove recordings and transcripts scriptorium itself made in its own folders.
+        const own = [env.recordingsDir, outputDir(opts)];
+        const removed = opts['keep-audio'] ? [] : files.filter(f => isOwnFile(f, own) && fs.existsSync(f));
         removed.forEach(f => fs.rmSync(f, { force: true }));
         return printJson({ deleted: rest[0], removedFiles: removed });
       }
@@ -663,10 +781,26 @@ function cmdSpeakers(env, opts, [sub, noteId, speaker, name]) {
     if (!t) throw new UsageError(`Note ${noteId} has no transcript`);
     const speakerNames = { ...(t.metadata?.speakerNames || {}), [speaker]: name };
     store.updateComponent(t.id, { metadata: { ...(t.metadata || {}), speakerNames } });
-    printJson({ noteId, speakerNames });
+    printJson({ noteId, speakerNames, rewritten: rewriteTextFiles(store, noteId) });
   } finally {
     store.close();
   }
+}
+
+/**
+ * Writes the note's saved transcript files (the .txt next to a recording) again from the stored
+ * transcript, e.g. after a speaker was named. Returns the files written; a missing file is left
+ * missing (the user deleted or moved it).
+ */
+function rewriteTextFiles(store, noteId) {
+  const view = noteView(store, noteId);
+  const written = [];
+  for (const c of store.getComponents(noteId)) {
+    if (c.component_type !== 'text' || !c.file_path || !fs.existsSync(c.file_path)) continue;
+    fs.writeFileSync(c.file_path, render(view.segments, c.metadata?.format || 'timed', { speakerNames: view.speakerNames }));
+    written.push(c.file_path);
+  }
+  return written;
 }
 
 // ---- app ---------------------------------------------------------------------
@@ -742,12 +876,14 @@ function cmdDoctor(env) {
 const COMMANDS = {
   transcribe: { values: TRANSCRIBE_VALUES, booleans: TRANSCRIBE_BOOLEANS },
   record: {
-    values: [...TRANSCRIBE_VALUES, 'duration', 'mic', 'stop-file', 'audio-out'],
-    booleans: [...TRANSCRIBE_BOOLEANS, 'system', 'audio', 'detach'],
+    values: [...TRANSCRIBE_VALUES, 'duration', 'mic', 'stop-file', 'audio-out', 'output-dir'],
+    booleans: [...TRANSCRIBE_BOOLEANS, 'system', 'audio', 'detach', 'overwrite'],
   },
   stop: { values: ['id', 'timeout'], booleans: ['wait', 'all'] },
+  pause: { values: ['id'], booleans: ['all'] },
+  resume: { values: ['id'], booleans: ['all'] },
   status: {},
-  notes: { values: ['folder', 'search', 'limit', 'format', 'out'], booleans: ['keep-audio'] },
+  notes: { values: ['folder', 'search', 'limit', 'format', 'out', 'output-dir'], booleans: ['keep-audio'] },
   folders: { values: ['parent'] },
   speakers: {},
   app: {},
@@ -791,6 +927,10 @@ async function main(argv = process.argv.slice(2)) {
       case 'stop':
         await cmdStop(env, opts);
         break;
+      case 'pause':
+      case 'resume':
+        await cmdPause(env, opts, command === 'pause');
+        break;
       case 'status':
         cmdStatus(env);
         break;
@@ -829,7 +969,7 @@ async function main(argv = process.argv.slice(2)) {
   } catch (err) {
     const usage = err instanceof UsageError;
     process.stderr.write(`scriptorium: ${err.message}\n${usage ? 'Run "scriptorium help" for usage.\n' : ''}`);
-    process.exitCode = usage ? 2 : 1;
+    process.exitCode = err.exitCode ?? (usage ? 2 : 1);
   }
 }
 
