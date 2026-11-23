@@ -1,6 +1,8 @@
 'use strict';
 // Local note store. Mirrors the parts of Alt's schema that transcription touches
-// (lecture_notes, folders, note_components) without any sync columns: nothing leaves this machine.
+// (lecture_notes, note_components) without any sync columns: nothing leaves this machine.
+// The folders table and lecture_notes.folder_id stay in the schema so databases made before 0.6
+// (which had folders) open unchanged; nothing reads or writes them any more.
 //
 // A transcript component's content_text uses Alt's format: a JSON array of entries, each
 // { speaker, segments: [{ start, end, text, speaker }] } with times in ms from the recording start.
@@ -59,52 +61,14 @@ class Store {
     this.db.close();
   }
 
-  // ---- folders -------------------------------------------------------------
-
-  listFolders() {
-    return this.db.prepare('SELECT * FROM folders ORDER BY name').all().map(plain);
-  }
-
-  createFolder(name, parentId = null) {
-    if (parentId) this.requireFolder(parentId);
-    const row = { id: newId(), name, parent_id: parentId, created_at: now() };
-    this.db
-      .prepare('INSERT INTO folders (id, name, parent_id, created_at) VALUES (?, ?, ?, ?)')
-      .run(row.id, row.name, row.parent_id, row.created_at);
-    return row;
-  }
-
-  /** Folder by id or exact name; with create, a missing name becomes a new top-level folder. */
-  resolveFolder(ref, { create = false } = {}) {
-    if (ref === undefined || ref === null || ref === '' || ref === 'null') return null;
-    const byId = this.db.prepare('SELECT * FROM folders WHERE id = ?').get(ref);
-    if (byId) return plain(byId);
-    const byName = this.db.prepare('SELECT * FROM folders WHERE name = ?').all(ref);
-    if (byName.length > 1) throw new UsageError(`More than one folder is named "${ref}"; use its id`);
-    if (byName.length === 1) return plain(byName[0]);
-    if (create) return this.createFolder(ref);
-    throw new UsageError(`No folder "${ref}"`);
-  }
-
-  requireFolder(id) {
-    const row = this.db.prepare('SELECT * FROM folders WHERE id = ?').get(id);
-    if (!row) throw new UsageError(`No folder ${id}`);
-    return plain(row);
-  }
-
-  deleteFolder(id) {
-    this.requireFolder(id);
-    this.db.prepare('DELETE FROM folders WHERE id = ?').run(id);
-  }
-
   // ---- notes ---------------------------------------------------------------
 
-  createNote({ title, folderId = null, type, status = 'processing', sourcePath = null, lectureDate }) {
+  createNote({ title, type, status = 'processing', sourcePath = null, lectureDate }) {
     const t = now();
     const row = {
       id: newId(),
       title,
-      folder_id: folderId,
+      folder_id: null,
       lecture_date: lectureDate || t,
       type,
       status,
@@ -118,22 +82,18 @@ class Store {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(...Object.values(row));
-    return row;
+    return noteRow(row);
   }
 
   getNote(id) {
     const row = this.db.prepare('SELECT * FROM lecture_notes WHERE id = ?').get(id);
     if (!row) throw new UsageError(`No note ${id}`);
-    return plain(row);
+    return noteRow(row);
   }
 
-  listNotes({ folderId, search, limit = 50 } = {}) {
+  listNotes({ search, limit = 50 } = {}) {
     const where = [];
     const args = [];
-    if (folderId !== undefined) {
-      where.push(folderId === null ? 'n.folder_id IS NULL' : 'n.folder_id = ?');
-      if (folderId !== null) args.push(folderId);
-    }
     if (search) {
       // Title or transcript text, like Alt's lectureNotes:search.
       where.push(
@@ -144,12 +104,12 @@ class Store {
     }
     const sql = `SELECT n.* FROM lecture_notes n ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
                  ORDER BY n.lecture_date DESC LIMIT ?`;
-    return this.db.prepare(sql).all(...args, limit).map(plain);
+    return this.db.prepare(sql).all(...args, limit).map(noteRow);
   }
 
   updateNote(id, changes) {
     this.getNote(id);
-    const allowed = ['title', 'folder_id', 'status', 'lecture_date'];
+    const allowed = ['title', 'status', 'lecture_date'];
     const keys = Object.keys(changes).filter(k => allowed.includes(k));
     if (keys.length === 0) return this.getNote(id);
     const sets = keys.map(k => `${k} = ?`).join(', ');
@@ -234,6 +194,12 @@ class Store {
 /** node:sqlite returns null-prototype rows; JSON output wants plain objects. */
 function plain(row) {
   return row ? { ...row } : row;
+}
+
+/** A note row without the unused folder_id column. */
+function noteRow(row) {
+  const { folder_id, ...note } = plain(row);
+  return note;
 }
 
 class UsageError extends Error {}

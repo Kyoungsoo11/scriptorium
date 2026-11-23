@@ -5,7 +5,7 @@ Offline lecture/meeting transcription for Windows — a small tray app and a non
 
 - 오디오·비디오 파일 전사, 마이크 + 컴퓨터 소리(시스템 오디오) 실시간 녹음 전사
 - 화자 분리 (누가 말했는지 `SPEAKER_00`, `SPEAKER_01` …), 화자 이름 붙이기
-- 자막(SRT/VTT), 텍스트, Markdown, JSON 내보내기, 노트·폴더·검색
+- 녹음·전사마다 `문서\Scriptorium\<제목>.txt` 전사본, 자막(SRT/VTT)·Markdown·JSON 내보내기, 노트 검색
 - **모든 명령이 옵션만으로 끝까지 실행**된다. 묻는 화면이 없어서 스크립트·자동화·AI 에이전트가 호출하기 좋다
 - 결과는 stdout에 JSON, 진행 상황은 stderr. 종료 코드 0/1/2
 - **Claude Desktop 채팅에서 말로 시킬 수 있다** (MCP 서버 내장): "이 강의 파일 전사해 줘", "지금부터 회의 녹음해 줘"
@@ -131,7 +131,6 @@ scriptorium <명령> [옵션]
 | `pause`, `resume` | 녹음 일시 정지, 다시 시작 |
 | `status` | 실행 중인 녹음 목록 |
 | `notes …` | 노트 목록·보기·내보내기·이름 변경·이동·삭제 |
-| `folders …` | 폴더 목록·만들기·삭제 |
 | `speakers rename …` | 화자 이름 붙이기 |
 | `app` | 트레이 앱 열기 |
 | `devices` | 오디오 장치 목록 |
@@ -145,11 +144,12 @@ scriptorium transcribe <파일> [<파일> …] [옵션]
 ```
 
 - 지원 형식: Windows가 열 수 있는 대부분의 오디오·비디오 (mp3, m4a, aac, wav, flac, wma, mp4, mov 등). 비디오는 소리만 쓴다.
-- 기본으로 노트를 저장하고, 결과 JSON을 출력한다.
+- 기본으로 노트를 저장하고, 전사본을 `문서\Scriptorium\<파일 이름>.txt`(녹음과 같은 `(mm:ss)` 형식)로 쓰면서 진행하고, 결과 JSON을 출력한다.
+- 그 이름의 `.txt`가 이미 있으면 시작하지 않고 종료 코드 3 (`--overwrite`로 덮어쓰기, `--title`로 다른 이름, `--no-text`로 전사본 없이). 여러 파일이면 모두 확인한 뒤 시작한다.
 
 ```bash
-# 한국어 강의, "운영체제" 폴더에 저장 (폴더가 없으면 만든다)
-scriptorium transcribe 3주차.m4a --lang ko --folder 운영체제
+# 한국어 강의 → 문서\Scriptorium\3주차.txt
+scriptorium transcribe 3주차.m4a --lang ko
 
 # 노트 저장 없이 자막 파일만
 scriptorium transcribe 3주차.mp4 --lang ko --no-save --out 3주차.srt
@@ -158,7 +158,7 @@ scriptorium transcribe 3주차.mp4 --lang ko --no-save --out 3주차.srt
 scriptorium transcribe 회의.m4a --speakers 2 --out 회의.md
 
 # 여러 파일을 차례로 (각각 노트가 된다)
-scriptorium transcribe 1주차.m4a 2주차.m4a 3주차.m4a --lang ko --folder 자료구조
+scriptorium transcribe 1주차.m4a 2주차.m4a 3주차.m4a --lang ko
 
 # 텍스트만 화면에 출력
 scriptorium transcribe 메모.m4a --format txt --no-save
@@ -177,7 +177,7 @@ scriptorium record [옵션]
 
 ```bash
 # 50분 동안 녹음 (마이크 + 시스템 오디오)
-scriptorium record --duration 50m --lang ko --title "자료구조 7주차" --folder 자료구조
+scriptorium record --duration 50m --lang ko --title "자료구조 7주차"
 
 # 온라인 강의: 컴퓨터 소리만 (마이크 끔)
 scriptorium record --mic none --lang ko --duration 1h30m
@@ -196,7 +196,7 @@ scriptorium stop
 scriptorium record --duration 10m --stream
 ```
 
-녹음은 `문서\Scriptorium\<제목>.wav`(16 kHz)로, 전사본은 그 옆 `<제목>.txt`로 남는다. 제목을 주지 않으면 시작 시각이 제목이 된다 (예: `2026-11-23 14-30`). 파일 이름에 쓸 수 없는 문자(`\ / : * ? " < > |`)는 `_`로 바뀐다.
+녹음은 `문서\Scriptorium\<제목>.wav`(16 kHz)로, 전사본은 그 옆 `<제목>.txt`로 남는다. 전사본은 녹음하는 동안 계속 갱신되므로 프로그램이 도중에 꺼져도 그때까지의 내용이 남는다. 제목을 주지 않으면 시작 시각이 제목이 된다 (예: `2026-11-23 14-30`). 파일 이름에 쓸 수 없는 문자(`\ / : * ? " < > |`)는 `_`로 바뀐다.
 
 - 같은 이름의 파일이 이미 있으면 녹음을 시작하지 않고 종료 코드 3으로 끝난다. 덮어쓰려면 `--overwrite`. 지금 녹음 중인 파일은 `--overwrite`로도 덮어쓰지 않는다
 - 폴더 바꾸기: `--output-dir <폴더>` 또는 환경 변수 `SCRIPTORIUM_OUTPUT`
@@ -217,27 +217,23 @@ scriptorium stop --timeout 20m     # 마무리를 기다리는 최대 시간 (�
 
 `stop`은 녹음을 끝낸 뒤 남은 전사와 화자 분리가 끝날 때까지 기다렸다가 노트 요약을 출력한다.
 
-### notes / folders / speakers
+### notes / speakers
 
 ```bash
 scriptorium notes list                              # 최근 노트 50개
 scriptorium notes list --search 스케줄링 --limit 10  # 제목·전사 내용 검색
-scriptorium notes list --folder 운영체제             # 폴더 안 노트 (--folder null: 폴더 없는 노트)
 scriptorium notes show <noteId>                     # 노트 + 문장 전체 (JSON)
 scriptorium notes show <noteId> --format md         # Markdown으로 보기
-scriptorium notes export <noteId> --out 강의.srt    # 형식은 확장자로 (srt, vtt, txt, md, json)
+scriptorium notes export <noteId> --out 강의.srt    # 형식은 확장자로 (srt, vtt, txt, md, json), timed는 --format으로
 scriptorium notes export <noteId> --format vtt --out 강의.vtt
 scriptorium notes rename <noteId> "운영체제 7주차"
-scriptorium notes move <noteId> 운영체제            # 폴더 이름 또는 id, 폴더에서 빼려면 null
-scriptorium notes delete <noteId>                   # 노트와 Scriptorium이 만든 녹음 파일 삭제
-scriptorium notes delete <noteId> --keep-audio      # 녹음 파일은 남김
+scriptorium notes delete <noteId>                   # 노트와 Scriptorium이 만든 녹음·전사본 파일 삭제
+scriptorium notes delete <noteId> --keep-files      # 파일은 남김
 
-scriptorium folders list
-scriptorium folders create 운영체제 [--parent <폴더id>]
-scriptorium folders delete 운영체제                 # 노트는 지워지지 않고 폴더 밖으로 나옴
-
-scriptorium speakers rename <noteId> SPEAKER_00 "김교수"   # 이후 내보내기에 이름으로 표시
+scriptorium speakers rename <noteId> SPEAKER_00 "김교수"   # 내보내기와 .txt 전사본에 이름으로 표시
 ```
+
+0.6.0에서 폴더 기능(`folders`, `notes move`, `--folder`)을 없앴다. 노트는 검색(`notes list --search`)으로 찾고, 파일은 `문서\Scriptorium`에서 본다.
 
 ### devices / doctor
 
@@ -260,11 +256,13 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 | `--prompt <텍스트>` | 용어·이름 힌트 | 없음 |
 | `--vad-threshold <0~1>` | 말소리 감지 민감도. 작은 목소리를 놓치면 낮추고(0.1), 잡음을 말로 착각하면 높인다(0.3) | `0.15` |
 | `--beam <n>` | 탐색 폭. 1이면 빠르지만 정확도가 조금 떨어짐 | `5` |
-| `--threads <n>` | CPU 스레드 수 | 코어 수, 최대 16 |
+| `--threads <n>` | CPU 스레드 수 | 코어 수를 이미 실행 중인 녹음·전사와 나눈 몫 (2~16) |
 | `--backend <auto\|cpu\|gpu>` | GPU 빌드에서 GPU 사용 여부 | `auto` |
 | `--gpu <n>` | 사용할 GPU 번호 | 0 |
 | `--title <제목>` | 노트 제목 | 파일 이름 / 녹음 시각 |
-| `--folder <이름\|id>` | 노트를 넣을 폴더 (없으면 만듦) | 없음 |
+| `--output-dir <폴더>` | `.wav`/`.txt`를 둘 폴더 | `문서\Scriptorium` (`SCRIPTORIUM_OUTPUT`) |
+| `--overwrite` | 같은 이름의 `.wav`/`.txt`를 덮어씀 (없으면 종료 코드 3) | 덮어쓰지 않음 |
+| `--no-text` | `<제목>.txt` 전사본을 쓰지 않음 | 씀 |
 | `--no-save` | 노트로 저장하지 않음 | 저장 |
 | `--format <json\|srt\|vtt\|txt\|md\|timed>` | 결과 JSON 대신 이 형식을 stdout에 | 결과 JSON |
 | `--out <파일>` | 전사를 파일로 저장 (형식은 `--format` 또는 확장자) | 없음 |
@@ -279,9 +277,6 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 | `--duration <시간>` | 이만큼 녹음하고 멈춤 (일시 정지한 시간은 빼고 셈). `90s`, `45m`, `1h30m`, `1:30:00`, 숫자만 쓰면 초 |
 | `--mic <id\|default\|none>` | 마이크. `none`이면 시스템 오디오만 |
 | `--no-system` | 시스템 오디오 끔 (마이크만) |
-| `--stop-file <경로>` | 이 파일이 생기면 멈춤 |
-| `--output-dir <폴더>` | `<제목>.wav`, `<제목>.txt`를 둘 폴더 (기본 `문서\Scriptorium`, 또는 `SCRIPTORIUM_OUTPUT`) |
-| `--overwrite` | 같은 이름의 `.wav`/`.txt`가 있으면 덮어씀 (없으면 종료 코드 3) |
 | `--audio-out <파일.wav>` | 녹음 파일 위치 (전사본은 그 옆에) |
 | `--no-audio` | 녹음 파일을 남기지 않음 (전사본은 남김) |
 | `--detach` | 백그라운드로 시작하고 noteId를 출력한 뒤 바로 종료 |
@@ -323,7 +318,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 - `start`, `end`: 녹음/파일 시작부터의 밀리초
 - `noteId`: `--no-save`면 `null`
 - `retriedPieces`: 놓친 말소리를 다시 전사한 횟수
-- record는 `audioPath`, `textPath`(전사본), `startedAt`, `pausedSeconds`, `stopReason`(`duration`, `stop-file`, `signal`, `error`)이 더 붙는다
+- record는 `audioPath`, `textPath`(전사본), `startedAt`, `pausedSeconds`, `stopReason`(`duration`, `stop`, `signal`, `error`)이 더 붙는다
 - `saved`: `--out`을 줬을 때 저장한 파일
 
 ### 형식
@@ -364,7 +359,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 | 0 | 성공 |
 | 1 | 실행 중 실패 (파일을 못 읽음, 장치 오류 등). stderr에 `scriptorium: <이유>` |
 | 2 | 잘못된 사용법 (모르는 옵션, 빠진 인자 등) |
-| 3 | `record`: 같은 이름의 녹음 파일이 이미 있음 (`--title`을 바꾸거나 `--overwrite`) |
+| 3 | `record`, `transcribe`: 같은 이름의 `.wav`/`.txt`가 이미 있음 (`--title`을 바꾸거나 `--overwrite`) |
 
 ---
 
@@ -374,7 +369,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 
 1. `--duration 50m`: 시간이 되면 멈춤
 2. `scriptorium stop`: 다른 창이나 스크립트에서
-3. `--stop-file C:\tmp\stop`: 그 파일이 생기면 멈춤 (`type nul > C:\tmp\stop`)
+3. 트레이 앱의 **정지** 버튼, 또는 Claude에게 "녹음 멈춰"
 4. 녹음 중인 콘솔에서 Ctrl+C
 
 녹음이 멈추면 남은 문장 전사 → 화자 분리 → 노트 저장 순으로 마무리한다 (1시간 녹음이면 화자 분리에 몇 분 걸린다).
@@ -436,15 +431,14 @@ scriptorium setup-claude
 
 | 도구 | 하는 일 |
 |---|---|
-| `scriptorium_transcribe_file` | 파일 전사를 백그라운드 작업으로 시작, jobId 반환 |
+| `scriptorium_transcribe_file` | 파일 전사를 백그라운드 작업으로 시작, jobId 반환 (전사본은 `문서\Scriptorium\<제목>.txt`) |
 | `scriptorium_get_job` | 작업 진행률·결과 (jobId 없이 부르면 최근 작업 목록) |
 | `scriptorium_start_recording` | 녹음 시작 (마이크/시스템 오디오/시간 제한 선택). 같은 제목의 파일이 있으면 실패하고, `overwrite: true`면 덮어씀 |
-| `scriptorium_pause_recording`, `scriptorium_resume_recording` | 녹음 일시 정지, 다시 시작 |
-| `scriptorium_stop_recording` | 녹음 정지, 최대 50초 동안 마무리를 기다림 |
+| `scriptorium_control_recording` | 녹음 일시 정지(`pause`), 다시 시작(`resume`), 정지(`stop`, 최대 50초 동안 마무리를 기다림) |
 | `scriptorium_list_recordings` | 실행 중인 녹음 |
 | `scriptorium_list_notes` | 노트 목록·검색 |
 | `scriptorium_get_transcript` | 전사 읽기 (긴 전사는 쪽 단위) |
-| `scriptorium_export_transcript` | 파일로 저장 (srt/vtt/txt/md/json) |
+| `scriptorium_export_transcript` | 파일로 저장 (srt/vtt/txt/md/timed/json) |
 | `scriptorium_rename_speaker` | 화자 이름 붙이기 (녹음 옆 `.txt` 전사본도 다시 씀) |
 | `scriptorium_rename_note` | 노트 제목 바꾸기 |
 | `scriptorium_list_devices` | 오디오 장치 |
@@ -520,7 +514,7 @@ scriptorium notes export <noteId> --out 회의.md
 | `SCRIPTORIUM_NO_GUI` | `1`이면 녹음·전사 중 트레이 앱을 띄우지 않음 |
 | `SCRIPTORIUM_APP` | 트레이 앱 `Scriptorium.exe` 경로 |
 
-노트 DB는 일반 SQLite 파일이다. 표: `lecture_notes`(노트), `folders`, `note_components`(전사·녹음 파일). 전사는 `component_type = 'transcript'`인 행의 `content_text`에 JSON(`[{speaker, segments:[{start,end,text,speaker}]}]`, ms)으로, 화자 이름은 `metadata.speakerNames`에 들어 있다.
+노트 DB는 일반 SQLite 파일이다. 표: `lecture_notes`(노트), `note_components`(전사, 녹음 `recording`, 전사본 `text` 파일). `folders` 표와 `folder_id`는 0.5.0까지의 DB를 그대로 열기 위해 남아 있을 뿐 쓰지 않는다. 전사는 `component_type = 'transcript'`인 행의 `content_text`에 JSON(`[{speaker, segments:[{start,end,text,speaker}]}]`, ms)으로, 화자 이름은 `metadata.speakerNames`에 들어 있다.
 
 ---
 

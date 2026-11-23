@@ -1,7 +1,8 @@
 'use strict';
 // `scriptorium mcp`: an MCP server over stdio (newline-delimited JSON-RPC 2.0) so that Claude
-// Desktop's chat, or any MCP client, can drive Scriptorium. Each tool runs the CLI as a child
-// process and returns its JSON, so the server adds no behaviour of its own.
+// Desktop's chat, or any MCP client, can drive Scriptorium. Reads (notes, transcripts, running
+// recordings) and recording control call the command functions in this process; work that runs
+// on (recording, file transcription) starts the CLI detached, so it outlives this server.
 //
 // File transcription can take longer than a client waits for one tool call (a 70-minute
 // lecture takes ~28 minutes on CPU), so it runs as a background job: one tool starts it and
@@ -16,6 +17,9 @@ const readline = require('node:readline');
 const { spawn } = require('node:child_process');
 
 const { resolveEnv } = require('./env');
+const { listDevices } = require('./native');
+const notes = require('./commands/notes');
+const { setPaused, stopRecordings, recordingStatus } = require('./commands/record');
 
 const VERSION = require('../package.json').version;
 const CLI = path.join(__dirname, '..', 'bin', 'scriptorium.js');
@@ -27,11 +31,11 @@ const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this comp
   audio length on CPU (a 1-hour lecture ≈ 25 min). Call scriptorium_get_job every minute or two until
   status is "done", then read the note with scriptorium_get_transcript.
 - Record: scriptorium_start_recording (microphone + computer audio by default; mic "none" = computer audio
-  only, e.g. an online lecture), later scriptorium_stop_recording. Stopping finishes the transcript, which
-  can take a few minutes for long recordings. scriptorium_pause_recording / scriptorium_resume_recording
-  leave the paused time out of the recording.
-- A recording is saved as <title>.wav plus <title>.txt (the transcript) in Documents\\Scriptorium. If that
-  name is taken, start_recording fails; ask the user for another title, or pass overwrite: true only when
+  only, e.g. an online lecture). scriptorium_control_recording pauses, resumes or stops it; stopping
+  finishes the transcript, which can take a few minutes for long recordings. Paused time is left out.
+- Files: a recording is saved as <title>.wav plus <title>.txt (the transcript, written as it goes) in
+  Documents\\Scriptorium; a transcribed file gets <title>.txt there. Results give audioPath / textPath.
+  If the name is taken, starting fails: ask the user for another title, or pass overwrite: true only when
   they agree to replace the old files.
 - Transcripts are long: read them in pages with offset/maxChars, or export to a file.
 - Speakers are SPEAKER_00, SPEAKER_01, ...; name them with scriptorium_rename_speaker. If the user knows how
@@ -45,8 +49,8 @@ const TRANSCRIBE_PROPS = {
   language: str('Language code such as "ko" or "en", or "auto" (default). Giving it is faster and more accurate.'),
   speakers: int('Number of speakers, if known. Omit to estimate.', { minimum: 1 }),
   diarize: { type: 'boolean', description: 'Separate speakers (default true). False is faster.' },
-  title: str('Note title (default: file name or recording time).'),
-  folder: str('Folder name or id to put the note in; created if missing.'),
+  title: str('Title, also the file name of the .wav/.txt (default: file name or recording start time).'),
+  overwrite: { type: 'boolean', description: 'Replace existing files with this name (default false: fail if the name is taken).' },
   prompt: str('Words or names likely to appear, to help recognition (e.g. "LRU, 세마포어").'),
 };
 
@@ -82,31 +86,23 @@ const TOOLS = [
         mic: str('"default" (default), "none" for computer audio only, or a device id from scriptorium_list_devices.'),
         systemAudio: { type: 'boolean', description: 'Also capture what the computer plays (default true).' },
         duration: str('Stop automatically after this much recorded time, e.g. "50m", "1h30m". Omit to record until stopped.'),
-        overwrite: { type: 'boolean', description: 'Replace existing <title>.wav/.txt files (default false: fail if the name is taken).' },
         ...TRANSCRIBE_PROPS,
       },
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
-    name: 'scriptorium_pause_recording',
-    title: 'Pause a recording',
-    description: 'Pauses a running recording; nothing is recorded until scriptorium_resume_recording, and the paused time is left out of the file and the transcript times.',
-    inputSchema: { type: 'object', properties: { noteId: str('Recording to pause; may be omitted when only one is running.') } },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-  },
-  {
-    name: 'scriptorium_resume_recording',
-    title: 'Resume a recording',
-    description: 'Resumes a paused recording.',
-    inputSchema: { type: 'object', properties: { noteId: str('Recording to resume; may be omitted when only one is running.') } },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-  },
-  {
-    name: 'scriptorium_stop_recording',
-    title: 'Stop a recording',
-    description: `Stops a running recording and waits up to ${STOP_WAIT_S} s for its transcript. If it is still finishing, check again with scriptorium_list_recordings or scriptorium_get_transcript.`,
-    inputSchema: { type: 'object', properties: { noteId: str('Recording to stop; may be omitted when only one is running.') } },
+    name: 'scriptorium_control_recording',
+    title: 'Pause, resume or stop a recording',
+    description: `action "pause" stops recording until "resume" (the paused time is left out of the file and the transcript times). "stop" ends it and waits up to ${STOP_WAIT_S} s for the transcript (the result has textPath); if it is still finishing, check again with scriptorium_list_recordings or scriptorium_get_transcript.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: str('"pause", "resume" or "stop".', { enum: ['pause', 'resume', 'stop'] }),
+        noteId: str('Recording to act on; may be omitted when only one is running.'),
+      },
+      required: ['action'],
+    },
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
   {
@@ -119,12 +115,11 @@ const TOOLS = [
   {
     name: 'scriptorium_list_notes',
     title: 'List or search notes',
-    description: 'Notes newest first (id, title, date, status, folder). Search matches titles and transcript text.',
+    description: 'Notes newest first (id, title, date, status). Search matches titles and transcript text.',
     inputSchema: {
       type: 'object',
       properties: {
         search: str('Words to find in titles or transcripts.'),
-        folder: str('Folder name or id; "null" for notes outside folders.'),
         limit: int('Maximum notes (default 50).', { minimum: 1, maximum: 500 }),
       },
     },
@@ -139,8 +134,8 @@ const TOOLS = [
       type: 'object',
       properties: {
         noteId: str('Note id.'),
-        format: str('"md" (default: paragraphs by speaker with times), "txt", "srt", "vtt" or "json".', {
-          enum: ['md', 'txt', 'srt', 'vtt', 'json'],
+        format: str('"md" (default: paragraphs by speaker with times), "timed" (the .txt file\'s format), "txt", "srt", "vtt" or "json".', {
+          enum: ['md', 'timed', 'txt', 'srt', 'vtt', 'json'],
         }),
         offset: int('Character offset to start from (default 0).', { minimum: 0 }),
         maxChars: int(`Characters per page (default ${DEFAULT_TEXT_LIMIT}).`, { minimum: 1000, maximum: 200000 }),
@@ -158,7 +153,7 @@ const TOOLS = [
       properties: {
         noteId: str('Note id.'),
         path: str('Absolute path of the file to write; the extension picks the format unless format is given.'),
-        format: str('"srt", "vtt", "txt", "md" or "json".', { enum: ['md', 'txt', 'srt', 'vtt', 'json'] }),
+        format: str('"srt", "vtt", "txt", "md", "timed" or "json".', { enum: ['md', 'timed', 'txt', 'srt', 'vtt', 'json'] }),
       },
       required: ['noteId', 'path'],
     },
@@ -236,9 +231,18 @@ function transcribeArgs(a) {
   if (a.speakers) out.push('--speakers', String(a.speakers));
   if (a.diarize === false) out.push('--no-diarize');
   if (a.title) out.push('--title', String(a.title));
-  if (a.folder) out.push('--folder', String(a.folder));
+  if (a.overwrite === true) out.push('--overwrite');
   if (a.prompt) out.push('--prompt', String(a.prompt));
   return out;
+}
+
+/** Runs a command function here; its errors become tool errors the client shows as text. */
+async function direct(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    throw new ToolError(e.message);
+  }
 }
 
 function need(a, ...keys) {
@@ -360,45 +364,30 @@ async function callTool(env, name, a = {}) {
       if (a.mic) args.push('--mic', String(a.mic));
       if (a.systemAudio === false) args.push('--no-system');
       if (a.duration) args.push('--duration', String(a.duration));
-      if (a.overwrite === true) args.push('--overwrite');
       return cliJson(args, { timeoutMs: 120000 });
     }
-    case 'scriptorium_pause_recording':
-    case 'scriptorium_resume_recording': {
-      const args = [name === 'scriptorium_pause_recording' ? 'pause' : 'resume'];
-      if (a.noteId) args.push('--id', String(a.noteId));
-      return cliJson(args);
-    }
-    case 'scriptorium_stop_recording': {
-      const args = ['stop', '--timeout', `${STOP_WAIT_S}s`];
-      if (a.noteId) args.push('--id', String(a.noteId));
-      const r = await runCli(args, { timeoutMs: (STOP_WAIT_S + 30) * 1000 });
-      if (r.code === 0) return JSON.parse(r.stdout);
-      const err = cliError(r);
-      if (/Still finalizing/.test(err.message)) {
+    case 'scriptorium_control_recording': {
+      need(a, 'action');
+      const target = { id: a.noteId ? String(a.noteId) : undefined };
+      if (a.action === 'pause' || a.action === 'resume') return direct(() => setPaused(env, target, a.action === 'pause'));
+      if (a.action !== 'stop') throw new ToolError('action must be "pause", "resume" or "stop"');
+      const r = await direct(() => stopRecordings(env, target, STOP_WAIT_S * 1000));
+      if (r.pending.length) {
         return { status: 'finishing', message: 'Recording stopped; the transcript is still being finished. Check again in a minute.' };
       }
-      throw err;
+      return r.done.length === 1 ? r.done[0] : r.done;
     }
     case 'scriptorium_list_recordings':
-      return cliJson(['status']);
-    case 'scriptorium_list_notes': {
-      const args = ['notes', 'list'];
-      if (a.search) args.push('--search', String(a.search));
-      if (a.folder) args.push('--folder', String(a.folder));
-      if (a.limit) args.push('--limit', String(a.limit));
-      return cliJson(args);
-    }
+      return recordingStatus(env);
+    case 'scriptorium_list_notes':
+      return direct(() => notes.listNotes(env, { search: a.search, limit: a.limit }));
     case 'scriptorium_get_transcript': {
       need(a, 'noteId');
-      const format = a.format || 'md';
-      const view = await cliJson(['notes', 'show', String(a.noteId)]);
-      const r = await runCli(['notes', 'show', String(a.noteId), '--format', format]);
-      if (r.code !== 0) throw cliError(r);
+      const { view, text: all } = await direct(() => notes.transcriptText(env, String(a.noteId), a.format || 'md'));
       const offset = Math.max(0, Number(a.offset) || 0);
       const limit = Math.max(1000, Number(a.maxChars) || DEFAULT_TEXT_LIMIT);
-      const text = r.stdout.slice(offset, offset + limit);
-      const next = offset + limit < r.stdout.length ? offset + limit : null;
+      const text = all.slice(offset, offset + limit);
+      const next = offset + limit < all.length ? offset + limit : null;
       return {
         __text: text,
         meta: {
@@ -407,26 +396,24 @@ async function callTool(env, name, a = {}) {
           status: view.note.status,
           segments: view.segments.length,
           speakerNames: view.speakerNames,
-          totalChars: r.stdout.length,
+          files: view.files.map(f => ({ type: f.type, path: f.path })),
+          totalChars: all.length,
           offset,
           nextOffset: next,
         },
       };
     }
-    case 'scriptorium_export_transcript': {
+    case 'scriptorium_export_transcript':
       need(a, 'noteId', 'path');
-      const args = ['notes', 'export', String(a.noteId), '--out', path.resolve(String(a.path))];
-      if (a.format) args.push('--format', String(a.format));
-      return cliJson(args);
-    }
+      return direct(() => notes.exportNote(env, String(a.noteId), path.resolve(String(a.path)), a.format));
     case 'scriptorium_rename_speaker':
       need(a, 'noteId', 'speaker', 'name');
-      return cliJson(['speakers', 'rename', String(a.noteId), String(a.speaker), String(a.name)]);
+      return direct(() => notes.renameSpeaker(env, String(a.noteId), String(a.speaker), String(a.name)));
     case 'scriptorium_rename_note':
       need(a, 'noteId', 'title');
-      return cliJson(['notes', 'rename', String(a.noteId), String(a.title)]);
+      return direct(() => notes.renameNote(env, String(a.noteId), String(a.title)));
     case 'scriptorium_list_devices':
-      return cliJson(['devices']);
+      return direct(() => ({ audio: listDevices(env) }));
     default:
       throw new ToolError(`Unknown tool ${name}`);
   }

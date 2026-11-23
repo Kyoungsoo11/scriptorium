@@ -52,6 +52,22 @@ test('setup-claude refuses a config that is not JSON', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('MCP reads run in-process and recording control is one tool', async () => {
+  const { callTool } = require('../src/mcp');
+  const { resolveEnv } = require('../src/env');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-mcp-direct-'));
+  const env = resolveEnv({ 'data-dir': dir });
+  assert.deepEqual(await callTool(env, 'scriptorium_list_notes', {}), []);
+  assert.deepEqual(await callTool(env, 'scriptorium_list_recordings', {}), { recording: false, recordings: [] });
+  await assert.rejects(callTool(env, 'scriptorium_control_recording', { action: 'pause' }), /No recording is running/);
+  await assert.rejects(callTool(env, 'scriptorium_get_transcript', { noteId: 'nope' }), /No note nope/);
+  assert.deepEqual(
+    TOOLS.map(t => t.name).filter(n => /recording/.test(n)),
+    ['scriptorium_start_recording', 'scriptorium_control_recording', 'scriptorium_list_recordings'],
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('tool definitions are well-formed', () => {
   const names = new Set();
   for (const t of TOOLS) {

@@ -71,17 +71,15 @@ test('WavWriter writes a valid header', () => {
   fs.rmSync(file);
 });
 
-test('Store keeps notes, folders, transcripts and search', () => {
+test('Store keeps notes, transcripts and search', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scriptorium-store-'));
   const store = new Store(path.join(dir, 'db.sqlite'));
-  const folder = store.resolveFolder('강의', { create: true });
-  assert.equal(store.resolveFolder('강의').id, folder.id);
-  const note = store.createNote({ title: 'OS', type: 'file', folderId: folder.id });
+  const note = store.createNote({ title: 'OS', type: 'file' });
+  assert.equal('folder_id' in note, false, 'folders are gone from what notes look like');
   const t = store.addComponent({ noteId: note.id, type: 'transcript', title: 'Transcript', contentText: '[]', metadata: { speakerNames: {} } });
   store.updateComponent(t.id, { contentText: JSON.stringify(toAltEntries([{ start: 0, end: 1, text: '스케줄링' }])) });
   assert.equal(store.listNotes({ search: '스케줄링' }).length, 1);
-  assert.equal(store.listNotes({ folderId: folder.id }).length, 1);
-  assert.equal(store.listNotes({ folderId: null }).length, 0);
+  assert.equal(store.listNotes().length, 1);
   store.updateNote(note.id, { title: '운영체제' });
   assert.equal(store.getNote(note.id).title, '운영체제');
   store.deleteNote(note.id);

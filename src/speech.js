@@ -204,9 +204,35 @@ function isHallucination(text) {
   return HALLUCINATION.test(text.trim()) || textLength(text) === 0;
 }
 
+/** A 50 ms frame quieter than this (RMS) holds no speech: digital silence or a very quiet room. */
+const QUIET_RMS = 0.002;
+/** A segment whose audio is quiet in more than this share of its frames was invented over silence. */
+const MAX_QUIET_SHARE = 0.8;
+
+/**
+ * Share of 50 ms frames in [startMs, endMs) of a chunk's audio that are quiet. Seen live: after
+ * the computer audio stopped, "감사합니다." over 10 s of digital silence (RMS 0.0000) that the VAD
+ * had let through; Whisper's no-speech probability was 0 for it, so it cannot catch this.
+ */
+function quietShare(audio, startMs, endMs) {
+  const frame = Math.round(SR * 0.05);
+  const from = Math.max(0, Math.floor((startMs / 1000) * SR));
+  const to = Math.min(audio.length, Math.ceil((endMs / 1000) * SR));
+  let quiet = 0;
+  let frames = 0;
+  for (let i = from; i + frame <= to; i += frame) {
+    let sum = 0;
+    for (let j = i; j < i + frame; j++) sum += audio[j] * audio[j];
+    if (Math.sqrt(sum / frame) < QUIET_RMS) quiet++;
+    frames++;
+  }
+  return frames ? quiet / frames : 0;
+}
+
 /** Whisper reply for a packed chunk → segments on the original timeline. */
-function mapSegments(reply, pieces) {
+function mapSegments(reply, pieces, audio = null) {
   return (reply.segments || [])
+    .filter(s => !audio || quietShare(audio, s.start, s.end) <= MAX_QUIET_SHARE)
     .map(s => ({
       start: toOriginalMs(pieces, s.start, 'start'),
       end: toOriginalMs(pieces, s.end, 'end'),
@@ -419,6 +445,7 @@ module.exports = {
   ChunkPacker,
   toOriginalMs,
   mapSegments,
+  quietShare,
   uncoveredChunk,
   isDuplicate,
   isSparse,
