@@ -88,6 +88,9 @@ function autoThreads(env, cpus = os.availableParallelism?.() ?? os.cpus().length
   return Math.max(2, Math.min(16, Math.floor(cpus / active)));
 }
 
+/** The language when --lang is not given; "--lang auto" asks for detection. */
+const DEFAULT_LANGUAGE = 'ko';
+
 function transcriptionOptions(opts, env) {
   if (opts.backend && !['auto', 'cpu', 'gpu'].includes(opts.backend))
     throw new UsageError('--backend takes auto, cpu or gpu');
@@ -107,8 +110,9 @@ function transcriptionOptions(opts, env) {
   // Speaker separation is off unless asked for: --diarize, or a number of speakers.
   const speakers = positive('speakers', opts.speakers);
   if (opts.diarize === false && speakers > 1) throw new UsageError('--speakers needs speaker separation; drop --no-diarize');
+  const lang = opts.lang || DEFAULT_LANGUAGE;
   return {
-    language: opts.lang && opts.lang !== 'auto' ? opts.lang : undefined,
+    language: lang === 'auto' ? undefined : lang,
     diarize: opts.diarize ?? speakers !== undefined,
     prompt: opts.prompt,
     speakers,
@@ -160,6 +164,7 @@ function streamer(opts) {
 }
 
 module.exports = {
+  DEFAULT_LANGUAGE,
   makeLog,
   printJson,
   openStore,

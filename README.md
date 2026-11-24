@@ -64,7 +64,7 @@ scriptorium.cmd doctor
 `"ok":true`가 나오면 준비 끝. 첫 전사:
 
 ```bash
-scriptorium.cmd transcribe "D:\강의\3주차.mp4" --lang ko --out 3주차.srt
+scriptorium.cmd transcribe "D:\강의\3주차.mp4" --out 3주차.srt
 ```
 
 어디서나 `scriptorium`으로 부르고 싶으면 압축 푼 폴더를 PATH에 추가한다 (설정 → 시스템 → 정보 → 고급 시스템 설정 → 환경 변수 → Path). 아래 예시는 PATH에 추가했다고 가정하고 `scriptorium`으로 적는다.
@@ -151,22 +151,25 @@ scriptorium transcribe <파일> [<파일> …] [옵션]
 
 ```bash
 # 한국어 강의 → 문서\Scriptorium\3주차.txt
-scriptorium transcribe 3주차.m4a --lang ko
+scriptorium transcribe 3주차.m4a
+
+# 영어 강의 (언어를 모르면 --lang auto)
+scriptorium transcribe lecture.mp4 --lang en
 
 # 노트 저장 없이 자막 파일만
-scriptorium transcribe 3주차.mp4 --lang ko --no-save --out 3주차.srt
+scriptorium transcribe 3주차.mp4 --no-save --out 3주차.srt
 
 # 2명이 나누는 회의: 화자 분리 (수를 모르면 --speakers 2 대신 --diarize)
 scriptorium transcribe 회의.m4a --speakers 2 --out 회의.md
 
 # 여러 파일을 차례로 (각각 노트가 된다)
-scriptorium transcribe 1주차.m4a 2주차.m4a 3주차.m4a --lang ko
+scriptorium transcribe 1주차.m4a 2주차.m4a 3주차.m4a
 
 # 텍스트만 화면에 출력
 scriptorium transcribe 메모.m4a --format txt --no-save
 
 # 전문 용어가 많을 때: 단어 힌트 주기
-scriptorium transcribe 강의.m4a --lang ko --prompt "페이지 교체, LRU, 스래싱, 세마포어"
+scriptorium transcribe 강의.m4a --prompt "페이지 교체, LRU, 스래싱, 세마포어"
 ```
 
 ### record — 실시간 녹음 전사
@@ -179,19 +182,19 @@ scriptorium record [옵션]
 
 ```bash
 # 50분 동안 녹음 (마이크 + 시스템 오디오)
-scriptorium record --duration 50m --lang ko --title "자료구조 7주차"
+scriptorium record --duration 50m --title "자료구조 7주차"
 
 # 온라인 강의: 컴퓨터 소리만 (마이크 끔)
-scriptorium record --mic none --lang ko --duration 1h30m
+scriptorium record --mic none --duration 1h30m
 
 # 대면 강의: 마이크만
-scriptorium record --no-system --lang ko --duration 75m
+scriptorium record --no-system --duration 75m
 
 # 특정 마이크 쓰기 (id는 devices 명령으로 확인)
 scriptorium record --mic "{0.0.1.00000000}.{xxxxxxxx-xxxx-...}" --duration 30m
 
 # 백그라운드로 시작하고 바로 돌아오기 → 나중에 stop
-scriptorium record --detach --lang ko --title "주간 회의"
+scriptorium record --detach --title "주간 회의"
 scriptorium stop
 
 # 진행 중 문장을 한 줄씩 받기
@@ -268,7 +271,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 
 | 옵션 | 설명 | 기본값 |
 |---|---|---|
-| `--lang <코드>` | 언어 (`ko`, `en`, `ja` …, `auto`) | `auto` |
+| `--lang <코드>` | 언어 (`ko`, `en`, `ja` …, `auto` = 자동 감지) | `ko` |
 | `--diarize` | 화자 분리 (끝난 뒤 시간이 더 걸림). `--no-diarize`는 끔 | 끔 |
 | `--speakers <n>` | 화자 수를 알면 지정. `--diarize`를 켠다 | 자동 추정 |
 | `--prompt <텍스트>` | 용어·이름 힌트 | 없음 |
@@ -286,7 +289,7 @@ scriptorium doctor     # 엔진, 모델 4개, 기본 마이크·스피커, 데�
 | `--out <파일>` | 전사를 파일로 저장 (형식은 `--format` 또는 확장자) | 없음 |
 | `--stream` | 진행 중 이벤트를 JSON Lines로 출력 | 끔 |
 
-`--lang`을 정해 주면 더 정확하고 빠르다. 한 묶음 안에서 다른 언어 문장이 빠지면 자동으로 언어 감지로 다시 전사해 메운다.
+언어를 주지 않으면 한국어로 전사한다 (0.8.0까지는 자동 감지). 다른 언어는 `--lang en`처럼 지정하고, 무슨 언어인지 모르면 `--lang auto`를 쓴다 (언어를 지정할 때보다 느리다). 한 묶음 안에서 다른 언어 문장이 빠지면 자동으로 언어 감지로 다시 전사해 메운다.
 
 ### 녹음 옵션 (record)
 
@@ -437,7 +440,8 @@ scriptorium setup-claude
 
 ### 이렇게 시키면 된다
 
-- "`D:\강의\3주차.m4a` 전사해 줘. 한국어야."
+- "`D:\강의\3주차.m4a` 전사해 줘."
+- "`D:\강의\lecture.mp4` 전사해 줘. 영어 강의야." (말하지 않으면 한국어로 전사)
 - "`D:\회의\주간.m4a` 전사해 줘. 세 명이 말하니까 화자도 나눠 줘."
 - "아까 전사 끝났어? 끝났으면 핵심 내용 요약해 줘."
 - "온라인 강의 들을 거니까 컴퓨터 소리만 녹음해 줘." → 끝나면 "녹음 멈춰."
@@ -471,7 +475,7 @@ scriptorium setup-claude
 **PowerShell**
 
 ```powershell
-$r = scriptorium transcribe .\lecture.m4a --lang ko --quiet | ConvertFrom-Json
+$r = scriptorium transcribe .\lecture.m4a --quiet | ConvertFrom-Json
 $r.segments | ForEach-Object { "{0,8:N1}s  {1}" -f ($_.start / 1000), $_.text }
 ```
 
@@ -480,7 +484,7 @@ $r.segments | ForEach-Object { "{0,8:N1}s  {1}" -f ($_.start / 1000), $_.text }
 ```python
 import json, subprocess
 out = subprocess.run(
-    ["scriptorium", "transcribe", "lecture.m4a", "--lang", "ko", "--quiet"],
+    ["scriptorium", "transcribe", "lecture.m4a", "--quiet"],
     capture_output=True, text=True, encoding="utf-8", check=True,
 )
 result = json.loads(out.stdout)
@@ -501,7 +505,7 @@ for line in p.stdout:
 **백그라운드 녹음 (에이전트 등)**
 
 ```bash
-scriptorium record --detach --lang ko --title "회의"   # noteId를 JSON으로 돌려줌
+scriptorium record --detach --title "회의"   # noteId를 JSON으로 돌려줌
 scriptorium status
 scriptorium stop                                       # 끝나면 노트 요약 JSON
 scriptorium notes export <noteId> --out 회의.md
@@ -563,9 +567,10 @@ scriptorium notes export <noteId> --out 회의.md
 |---|---|
 | `doctor`가 모델이 없다고 함 | 압축을 다 풀었는지 확인 (`models\` 폴더 4개 파일). zip 안에서 바로 실행하면 안 된다 |
 | 작은 목소리가 빠진다 | `--vad-threshold 0.1` |
-| 잡음·음악이 이상한 문장으로 나온다 | `--vad-threshold 0.3`, 또는 `--lang`을 지정 |
+| 잡음·음악이 이상한 문장으로 나온다 | `--vad-threshold 0.3` |
 | 전문 용어가 틀린다 | `--prompt "용어1, 용어2, …"` |
 | 영어 문장이 섞인 강의에서 문장이 빠진다 | 자동으로 다시 전사하지만, 많이 섞이면 `--lang auto` |
+| 영어 등 다른 언어 녹음이 제대로 전사되지 않는다 | 기본 언어가 한국어다. `--lang en`처럼 지정하거나 `--lang auto` |
 | 전사본에 화자가 안 나온다 | 화자 분리는 기본이 끔이다. `--diarize` 또는 `--speakers 2` |
 | 화자 수가 틀린다 | `--speakers 2`처럼 지정, 한 명이면 화자 분리를 끈다 |
 | 시스템 오디오가 녹음 안 된다 | 소리가 기본 출력 장치(`devices`의 `"default":true` 스피커)로 나는지 확인. 블루투스 장치를 바꾸면 다시 시작 |

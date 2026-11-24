@@ -64,7 +64,7 @@ Files
   (title = file name). A taken name stops before anything starts (exit code 3).
 
 Transcription options (transcribe, record)
-  --lang <code|auto>      language, e.g. ko, en (default: auto-detect)
+  --lang <code|auto>      language, e.g. ko, en; auto = detect (default ko)
   --diarize               separate speakers when the audio ends (default: off)
   --speakers <n>          number of speakers, when known (default: estimate); turns --diarize on
   --prompt <text>         vocabulary/context hint for Whisper
