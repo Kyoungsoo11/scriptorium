@@ -70,7 +70,7 @@ Transcription options (transcribe, record)
   --prompt <text>         vocabulary/context hint for Whisper
   --backend <auto|cpu|gpu>  gpu needs the GPU build (default auto)
   --gpu <index>           pin a GPU
-  --threads <n>           CPU threads (default: the CPU shared with the work already running, up to 16)
+  --threads <n>           CPU threads (default: the CPU shared with the work already running, 2 to 8)
   --beam <n>              beam size; 1 = greedy, faster (default 5)
   --vad-threshold <0-1>   speech detection sensitivity; lower keeps quieter speech (default 0.15)
   --title <text>          title, and the file name (default: file name / start time)
