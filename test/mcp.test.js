@@ -80,6 +80,16 @@ test('tool definitions are well-formed', () => {
   }
 });
 
+test('MCP: the language defaults to Korean, and only a given one is passed on', () => {
+  const { transcribeArgs } = require('../src/mcp');
+  for (const name of ['scriptorium_transcribe_file', 'scriptorium_start_recording']) {
+    assert.equal(TOOLS.find(t => t.name === name).inputSchema.properties.language.default, 'ko', name);
+  }
+  assert.deepEqual(transcribeArgs({}), [], 'left to the CLI default');
+  assert.deepEqual(transcribeArgs({ language: 'en' }), ['--lang', 'en']);
+  assert.deepEqual(transcribeArgs({ language: 'auto' }), ['--lang', 'auto']);
+});
+
 test('mcp server answers initialize, tools/list, errors and notifications', async () => {
   const p = spawn(process.execPath, [path.join(__dirname, '..', 'bin', 'scriptorium.js'), 'mcp'], {
     env: { ...process.env, SCRIPTORIUM_HOME: env.dataDir },

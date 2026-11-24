@@ -19,6 +19,7 @@ const { spawn } = require('node:child_process');
 const { resolveEnv } = require('./env');
 const { listDevices } = require('./native');
 const notes = require('./commands/notes');
+const { DEFAULT_LANGUAGE } = require('./commands/common');
 const { setPaused, stopRecordings, recordingStatus } = require('./commands/record');
 
 const VERSION = require('../package.json').version;
@@ -37,6 +38,8 @@ const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this comp
   Documents\\Scriptorium; a transcribed file gets <title>.txt there. Results give audioPath / textPath.
   If the name is taken, starting fails: ask the user for another title, or pass overwrite: true only when
   they agree to replace the old files.
+- The language is Korean unless given: pass language ("en", "ja", ...) when the audio is in another one, or
+  "auto" when it is unknown. A Korean lecture with some English in it is still Korean.
 - Transcripts are long: read them in pages with offset/maxChars, or export to a file.
 - Speakers are not separated by default. Pass diarize: true only when several people speak (a meeting, an
   interview) or the user asks who said what, not for a one-lecturer class: it takes longer and can split one
@@ -49,7 +52,10 @@ const str = (description, extra = {}) => ({ type: 'string', description, ...extr
 const int = (description, extra = {}) => ({ type: 'integer', description, ...extra });
 
 const TRANSCRIBE_PROPS = {
-  language: str('Language code such as "ko" or "en", or "auto" (default). Giving it is faster and more accurate.'),
+  language: str(
+    'Language spoken, as a code (default "ko", Korean). Pass another code such as "en" when the audio is in another language, or "auto" to detect it (slower) when the language is unknown.',
+    { default: DEFAULT_LANGUAGE },
+  ),
   diarize: {
     type: 'boolean',
     description: 'Separate speakers when the audio ends (default false). Only for audio where several people speak; slower.',
@@ -486,4 +492,4 @@ function serve(opts = {}) {
   return new Promise(resolve => rl.on('close', resolve));
 }
 
-module.exports = { serve, TOOLS, callTool, readJob };
+module.exports = { serve, TOOLS, callTool, readJob, transcribeArgs };

@@ -163,6 +163,15 @@ test('speaker separation is off unless asked for', () => {
   }
 });
 
+test('the language is Korean unless given; auto asks for detection', () => {
+  const { transcriptionOptions } = require('../src/commands/common');
+  const language = opts => transcriptionOptions(opts).language;
+  assert.equal(language({}), 'ko');
+  assert.equal(language({ lang: 'ko' }), 'ko');
+  assert.equal(language({ lang: 'en' }), 'en');
+  assert.equal(language({ lang: 'auto' }), undefined, 'undefined = let Whisper detect it');
+});
+
 test('a run keeps the audio only when it will separate speakers', () => {
   const { TranscriptionRun } = require('../src/transcriber');
   const separates = options => new TranscriptionRun({ env: {}, store: null, note: { type: 'file' }, options, log() {} }).separates;
