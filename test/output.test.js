@@ -137,6 +137,41 @@ test('whisper threads are shared with the work already running', () => {
   fs.rmSync(data, { recursive: true, force: true });
 });
 
+test('speaker separation is off unless asked for', () => {
+  const { transcriptionOptions } = require('../src/commands/common');
+  const { checkRequired } = require('../src/env');
+  const pick = opts => {
+    const { diarize, speakers } = transcriptionOptions(opts);
+    return [diarize, speakers];
+  };
+  assert.deepEqual(pick({}), [false, undefined]);
+  assert.deepEqual(pick({ diarize: true }), [true, undefined]);
+  assert.deepEqual(pick({ speakers: '3' }), [true, 3], 'a number of speakers turns it on');
+  assert.deepEqual(pick({ diarize: false }), [false, undefined], '--no-diarize is still accepted');
+  assert.deepEqual(pick({ diarize: false, speakers: '1' }), [false, 1]);
+  assert.throws(() => pick({ diarize: false, speakers: '2' }), /--no-diarize/);
+
+  const speakerModels = opts => checkRequired({}, opts).filter(r => /speaker/.test(r.name)).length;
+  const exists = fs.existsSync;
+  fs.existsSync = () => true;
+  try {
+    assert.equal(speakerModels({}), 0);
+    assert.equal(speakerModels({ diarize: true }), 2);
+    assert.equal(speakerModels({ diarize: true, speakers: 1 }), 0, 'one speaker needs no model');
+  } finally {
+    fs.existsSync = exists;
+  }
+});
+
+test('a run keeps the audio only when it will separate speakers', () => {
+  const { TranscriptionRun } = require('../src/transcriber');
+  const separates = options => new TranscriptionRun({ env: {}, store: null, note: { type: 'file' }, options, log() {} }).separates;
+  assert.equal(separates({}), false);
+  assert.equal(separates({ diarize: true }), true);
+  assert.equal(separates({ diarize: true, speakers: 2 }), true);
+  assert.equal(separates({ diarize: true, speakers: 1 }), false);
+});
+
 test('naming a speaker rewrites the saved transcript file', () => {
   const data = tmp('scriptorium-data-');
   const store = new Store(path.join(data, 'scriptorium.db'));

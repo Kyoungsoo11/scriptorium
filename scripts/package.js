@@ -118,9 +118,9 @@ const manifest = {
   name: 'scriptorium',
   display_name: 'Scriptorium',
   version: pkg.version,
-  description: 'Offline lecture and meeting transcription: audio/video files and live recording, with speaker separation.',
+  description: 'Offline lecture and meeting transcription: audio/video files and live recording, with optional speaker separation.',
   long_description:
-    'Transcribes audio and video files and live recordings (microphone plus computer audio) on this PC with whisper.cpp, separates speakers, and keeps notes you can search and export as subtitles, text or Markdown. Nothing is sent over the network.',
+    'Transcribes audio and video files and live recordings (microphone plus computer audio) on this PC with whisper.cpp, can separate speakers, and keeps notes you can search and export as subtitles, text or Markdown. Nothing is sent over the network.',
   author: { name: 'Kim Kyoungsoo', url: 'https://github.com/Kyoungsoo11' },
   repository: { type: 'git', url: 'https://github.com/Kyoungsoo11/scriptorium' },
   homepage: 'https://github.com/Kyoungsoo11/scriptorium',

@@ -104,11 +104,14 @@ function transcriptionOptions(opts, env) {
     return n;
   };
   if (opts.format && !FORMATS.includes(opts.format)) throw new UsageError(`--format takes ${FORMATS.join(', ')}`);
+  // Speaker separation is off unless asked for: --diarize, or a number of speakers.
+  const speakers = positive('speakers', opts.speakers);
+  if (opts.diarize === false && speakers > 1) throw new UsageError('--speakers needs speaker separation; drop --no-diarize');
   return {
     language: opts.lang && opts.lang !== 'auto' ? opts.lang : undefined,
-    diarize: opts.diarize !== false,
+    diarize: opts.diarize ?? speakers !== undefined,
     prompt: opts.prompt,
-    speakers: positive('speakers', opts.speakers),
+    speakers,
     useGpu: opts.backend !== 'cpu',
     gpu: opts.gpu,
     threads: positive('threads', opts.threads) ?? (env ? autoThreads(env) : undefined),

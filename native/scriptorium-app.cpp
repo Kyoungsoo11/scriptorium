@@ -72,6 +72,7 @@ enum FormId : UINT {
     ID_MIC,
     ID_LANG,
     ID_ADVANCED,
+    ID_DIARIZE,
     ID_SPEAKERS,
     ID_DURATION,
     ID_PROMPT,
@@ -490,7 +491,7 @@ std::wstring statusText(const Activity &a, bool *warn) {
         return s;
     }
     std::wstring s;
-    if (a.phase == L"finishing") s = L"화자 구분·마무리 중…";
+    if (a.phase == L"finishing") s = L"마무리 중…";
     else if (a.totalSeconds > 0) {
         int pct = (int)std::lround(100.0 * std::min(a.doneSeconds, a.totalSeconds) / a.totalSeconds);
         s = L"파일 전사 " + std::to_wstring(pct) + L"% (" + clockText((long long)a.doneSeconds) + L" / " +
@@ -668,7 +669,7 @@ struct Form {
     HWND header = nullptr;
     std::vector<HWND> labels;  // 제목, 소리, 마이크, 언어, 화자 수, 시간 제한, 단어 힌트
     HWND title = nullptr, source = nullptr, mic = nullptr, lang = nullptr;
-    HWND advanced = nullptr, speakers = nullptr, duration = nullptr, prompt = nullptr;
+    HWND advanced = nullptr, diarize = nullptr, speakers = nullptr, duration = nullptr, prompt = nullptr;
     HWND start = nullptr, clean = nullptr, status = nullptr;
     bool statusError = false;
     std::vector<std::wstring> micIds;  // parallel to the mic combo's items
@@ -765,6 +766,8 @@ void createForm() {
     form.lang = combo(ID_LANG, CBS_DROPDOWNLIST);
     for (auto &l : kLanguages) SendMessageW(form.lang, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(l[1]));
     form.advanced = makeChild(L"BUTTON", L"고급 설정", BS_AUTOCHECKBOX | WS_TABSTOP, ID_ADVANCED, g.font);
+    // Off at every start of the app, and not kept in gui.json: it is asked for per recording.
+    form.diarize = makeChild(L"BUTTON", L"화자 분리", BS_AUTOCHECKBOX | WS_TABSTOP, ID_DIARIZE, g.font);
     label(L"화자 수");
     form.speakers = edit(ID_SPEAKERS, L"자동", ES_NUMBER);
     label(L"시간 제한");
@@ -803,11 +806,17 @@ int layoutForm(int m, int y, int w) {
     }
     SetWindowPos(form.advanced, nullptr, fieldX, y, fieldW, S(22), SWP_NOZORDER);
     y += S(22) + gap;
+    ShowWindow(form.diarize, advanced ? SW_SHOW : SW_HIDE);
+    if (advanced) {
+        SetWindowPos(form.diarize, nullptr, fieldX, y, fieldW, S(22), SWP_NOZORDER);
+        y += S(22) + gap;
+    }
     HWND extra[] = {form.speakers, form.duration, form.prompt};
     for (int i = 0; i < 3; i++) {
-        ShowWindow(form.labels[kFields + i], advanced ? SW_SHOW : SW_HIDE);
-        ShowWindow(extra[i], advanced ? SW_SHOW : SW_HIDE);
-        if (!advanced) continue;
+        bool show = advanced && (extra[i] != form.speakers || Button_GetCheck(form.diarize) == BST_CHECKED);
+        ShowWindow(form.labels[kFields + i], show ? SW_SHOW : SW_HIDE);
+        ShowWindow(extra[i], show ? SW_SHOW : SW_HIDE);
+        if (!show) continue;
         SetWindowPos(form.labels[kFields + i], nullptr, m, y, labelW - S(6), rowH, SWP_NOZORDER);
         SetWindowPos(extra[i], nullptr, fieldX, y, i == 0 ? S(80) : fieldW, rowH, SWP_NOZORDER);
         y += rowH + gap;
@@ -942,11 +951,12 @@ void startRecording(bool overwrite = false) {
     if (!form.listsLoaded) micId = form.settings.mic;  // the list (with the saved choice) has not arrived yet
     int langSel = std::clamp((int)SendMessageW(form.lang, CB_GETCURSEL, 0, 0), 0, (int)std::size(kLanguages) - 1);
     bool advanced = Button_GetCheck(form.advanced) == BST_CHECKED;
-    std::wstring speakers = advanced ? windowText(form.speakers) : L"";
+    bool diarize = advanced && Button_GetCheck(form.diarize) == BST_CHECKED;
+    std::wstring speakers = diarize ? windowText(form.speakers) : L"";
     std::wstring duration = advanced ? windowText(form.duration) : L"";
     std::wstring prompt = advanced ? windowText(form.prompt) : L"";
-    if (!speakers.empty() && _wtoi(speakers.c_str()) < 1) {
-        setFormStatus(L"화자 수는 1 이상의 숫자로 적어 주세요.", true);
+    if (!speakers.empty() && _wtoi(speakers.c_str()) < 2) {
+        setFormStatus(L"화자 수는 2 이상의 숫자로 적거나 비워 주세요.", true);
         return;
     }
 
@@ -957,6 +967,7 @@ void startRecording(bool overwrite = false) {
     if (source == 1) args.insert(args.end(), {L"--mic", L"none"});
     else args.insert(args.end(), {L"--mic", micId});
     if (source == 2) args.push_back(L"--no-system");
+    if (diarize) args.push_back(L"--diarize");
     if (!speakers.empty()) args.insert(args.end(), {L"--speakers", speakers});
     if (!duration.empty()) args.insert(args.end(), {L"--duration", duration});
     if (!prompt.empty()) args.insert(args.end(), {L"--prompt", prompt});
@@ -1495,6 +1506,7 @@ void onCommand(UINT id, UINT code) {
         if (code == CBN_SELCHANGE) updateFormEnabled();
         break;
     case ID_ADVANCED:
+    case ID_DIARIZE:
         if (code == BN_CLICKED) fitWindow();
         break;
     case ID_SHOW: showWindow(); break;

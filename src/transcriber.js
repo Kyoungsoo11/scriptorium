@@ -3,7 +3,8 @@
 // into it. Shared by file transcription and live recording.
 //
 // Flow: audio → Silero VAD → speech regions packed into ≤28 s chunks → whisper.cpp → segments
-// mapped back to the original timeline → (at the end) speaker separation over the whole audio.
+// mapped back to the original timeline → (at the end, when asked for) speaker separation over the
+// whole audio.
 // Partial transcripts are saved while it runs, so an interrupted run keeps what it had.
 
 const { Whisper } = require('./native');
@@ -91,7 +92,7 @@ class TranscriptionRun {
   /** Feeds 16 kHz mono audio. In file mode, resolves when the recognizer has room for more. */
   async feed(samples) {
     this.fedSamples += samples.length;
-    if (this.options.diarize !== false) this.audio.push(samples);
+    if (this.separates) this.audio.push(samples);
     for (const region of this.detector.push(samples)) {
       for (const chunk of this.packer.add(region)) this.submit(chunk);
     }
@@ -140,6 +141,11 @@ class TranscriptionRun {
       })
       .finally(() => this.inFlight.delete(job));
     this.inFlight.add(job);
+  }
+
+  /** Whether speakers are separated at the end, which needs the whole audio (one speaker needs nothing). */
+  get separates() {
+    return Boolean(this.options.diarize) && this.options.speakers !== 1;
   }
 
   get fedSeconds() {
@@ -206,7 +212,11 @@ class TranscriptionRun {
     if (this.error) throw this.error;
 
     let speakers = [];
-    if (this.options.diarize !== false && this.segments.length) {
+    if (this.options.diarize && this.options.speakers === 1 && this.segments.length) {
+      this.segments = this.segments.map(s => ({ ...s, speaker: 'SPEAKER_00' }));
+      speakers = ['SPEAKER_00'];
+      this.emitChanges();
+    } else if (this.separates && this.segments.length) {
       this.log('separating speakers');
       const t0 = Date.now();
       const turns = diarize(this.env, concat(this.audio), {

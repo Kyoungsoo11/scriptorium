@@ -64,13 +64,13 @@ function resolveEnv(opts = {}) {
   };
 }
 
-function checkRequired(env, { diarize = true } = {}) {
+function checkRequired(env, { diarize = false, speakers } = {}) {
   const required = [
     ['native helper', env.coreExe],
     ['whisper model', env.whisperModel],
     ['VAD model', env.vadModel],
   ];
-  if (diarize) {
+  if (diarize && speakers !== 1) {
     required.push(['speaker segmentation model', env.segmentationModel], ['speaker embedding model', env.embeddingModel]);
   }
   return required.map(([name, file]) => ({ name, path: file, ok: fs.existsSync(file) }));
