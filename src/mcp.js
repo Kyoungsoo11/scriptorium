@@ -27,8 +27,8 @@ const DEFAULT_TEXT_LIMIT = 40000;
 const STOP_WAIT_S = 50;
 
 const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this computer, offline.
-- Transcribe a file: scriptorium_transcribe_file returns a jobId at once; the work takes about 0.4x the
-  audio length on CPU (a 1-hour lecture ≈ 25 min). Call scriptorium_get_job every minute or two until
+- Transcribe a file: scriptorium_transcribe_file returns a jobId at once; the work takes about 0.3x the
+  audio length on CPU (a 1-hour lecture ≈ 20 min), 0.4x with speaker separation. Call scriptorium_get_job every minute or two until
   status is "done", then read the note with scriptorium_get_transcript.
 - Record: scriptorium_start_recording (microphone + computer audio by default; mic "none" = computer audio
   only, e.g. an online lecture). scriptorium_control_recording pauses, resumes or stops it; stopping
@@ -38,8 +38,11 @@ const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this comp
   If the name is taken, starting fails: ask the user for another title, or pass overwrite: true only when
   they agree to replace the old files.
 - Transcripts are long: read them in pages with offset/maxChars, or export to a file.
-- Speakers are SPEAKER_00, SPEAKER_01, ...; name them with scriptorium_rename_speaker. If the user knows how
-  many people spoke, pass speakers (it is more accurate than the estimate).
+- Speakers are not separated by default. Pass diarize: true only when several people speak (a meeting, an
+  interview) or the user asks who said what, not for a one-lecturer class: it takes longer and can split one
+  voice into several speakers. If the user knows how many people spoke, pass speakers (it is more accurate
+  than the estimate, and turns diarize on). Speakers are then SPEAKER_00, SPEAKER_01, ...; name them with
+  scriptorium_rename_speaker.
 - File paths are on this Windows computer; use absolute paths.`;
 
 const str = (description, extra = {}) => ({ type: 'string', description, ...extra });
@@ -47,8 +50,11 @@ const int = (description, extra = {}) => ({ type: 'integer', description, ...ext
 
 const TRANSCRIBE_PROPS = {
   language: str('Language code such as "ko" or "en", or "auto" (default). Giving it is faster and more accurate.'),
-  speakers: int('Number of speakers, if known. Omit to estimate.', { minimum: 1 }),
-  diarize: { type: 'boolean', description: 'Separate speakers (default true). False is faster.' },
+  diarize: {
+    type: 'boolean',
+    description: 'Separate speakers when the audio ends (default false). Only for audio where several people speak; slower.',
+  },
+  speakers: int('Number of speakers, if known; turns diarize on. Omit to estimate.', { minimum: 1 }),
   title: str('Title, also the file name of the .wav/.txt (default: file name or recording start time).'),
   overwrite: { type: 'boolean', description: 'Replace existing files with this name (default false: fail if the name is taken).' },
   prompt: str('Words or names likely to appear, to help recognition (e.g. "LRU, 세마포어").'),
@@ -228,8 +234,9 @@ async function cliJson(args, opts) {
 function transcribeArgs(a) {
   const out = [];
   if (a.language) out.push('--lang', String(a.language));
-  if (a.speakers) out.push('--speakers', String(a.speakers));
+  if (a.diarize === true) out.push('--diarize');
   if (a.diarize === false) out.push('--no-diarize');
+  if (a.speakers) out.push('--speakers', String(a.speakers));
   if (a.title) out.push('--title', String(a.title));
   if (a.overwrite === true) out.push('--overwrite');
   if (a.prompt) out.push('--prompt', String(a.prompt));
@@ -285,7 +292,7 @@ function startJob(env, a) {
   fs.closeSync(log);
   const job = { jobId: id, pid: child.pid, file, startedAt: new Date().toISOString() };
   fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(job));
-  return { ...job, status: 'running', hint: 'Check with scriptorium_get_job; expect about 0.4x the audio length.' };
+  return { ...job, status: 'running', hint: 'Check with scriptorium_get_job; expect about 0.3x the audio length (0.4x with speaker separation).' };
 }
 
 function readJob(env, id) {

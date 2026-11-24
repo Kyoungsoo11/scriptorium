@@ -65,8 +65,8 @@ Files
 
 Transcription options (transcribe, record)
   --lang <code|auto>      language, e.g. ko, en (default: auto-detect)
-  --no-diarize            skip speaker separation
-  --speakers <n>          number of speakers, when known (default: estimate)
+  --diarize               separate speakers when the audio ends (default: off)
+  --speakers <n>          number of speakers, when known (default: estimate); turns --diarize on
   --prompt <text>         vocabulary/context hint for Whisper
   --backend <auto|cpu|gpu>  gpu needs the GPU build (default auto)
   --gpu <index>           pin a GPU
