@@ -28,8 +28,8 @@ const DEFAULT_TEXT_LIMIT = 40000;
 const STOP_WAIT_S = 50;
 
 const INSTRUCTIONS = `Scriptorium transcribes lectures and meetings on this computer, offline.
-- Transcribe a file: scriptorium_transcribe_file returns a jobId at once; the work takes about 0.3x the
-  audio length on CPU (a 1-hour lecture ≈ 20 min), 0.4x with speaker separation. Call scriptorium_get_job every minute or two until
+- Transcribe a file: scriptorium_transcribe_file returns a jobId at once; the work takes about 0.4x the
+  audio length on CPU (a 1-hour lecture ≈ 25 min), 0.5x with speaker separation. Call scriptorium_get_job every minute or two until
   status is "done", then read the note with scriptorium_get_transcript.
 - Record: scriptorium_start_recording (microphone + computer audio by default; mic "none" = computer audio
   only, e.g. an online lecture). scriptorium_control_recording pauses, resumes or stops it; stopping
@@ -298,7 +298,7 @@ function startJob(env, a) {
   fs.closeSync(log);
   const job = { jobId: id, pid: child.pid, file, startedAt: new Date().toISOString() };
   fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(job));
-  return { ...job, status: 'running', hint: 'Check with scriptorium_get_job; expect about 0.3x the audio length (0.4x with speaker separation).' };
+  return { ...job, status: 'running', hint: 'Check with scriptorium_get_job; expect about 0.4x the audio length (0.5x with speaker separation).' };
 }
 
 function readJob(env, id) {

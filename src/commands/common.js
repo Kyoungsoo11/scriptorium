@@ -79,13 +79,20 @@ function busyFiles(env) {
 }
 
 /**
+ * The most Whisper threads used when --threads is not given. On 8 cores (16 logical), 16 threads
+ * took 56% more CPU time than 8 and kept the whole CPU busy, for a run only 19% shorter (10 minutes
+ * of a lecture).
+ */
+const MAX_AUTO_THREADS = 8;
+
+/**
  * Whisper threads for a new piece of work when --threads is not given: the CPU shared between the
- * recordings and transcriptions running now and this one. Each whisper process otherwise takes up
- * to 16, and three at once on 16 cores made live text lag and finishing take minutes.
+ * recordings and transcriptions running now and this one (three at once, each on the whole CPU,
+ * made live text lag and finishing take minutes), from 2 to MAX_AUTO_THREADS.
  */
 function autoThreads(env, cpus = os.availableParallelism?.() ?? os.cpus().length) {
   const active = runningRecordings(env).length + runningTranscriptions(env).length + 1;
-  return Math.max(2, Math.min(16, Math.floor(cpus / active)));
+  return Math.max(2, Math.min(MAX_AUTO_THREADS, Math.floor(cpus / active)));
 }
 
 /** The language when --lang is not given; "--lang auto" asks for detection. */

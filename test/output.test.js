@@ -124,16 +124,24 @@ test('segments over digital silence are dropped, speech is kept', () => {
 });
 
 test('whisper threads are shared with the work already running', () => {
-  const { autoThreads } = require('../src/commands/common');
+  const { autoThreads, transcriptionOptions } = require('../src/commands/common');
   const data = tmp('scriptorium-data-');
   const run = path.join(data, 'run');
   fs.mkdirSync(run);
   const env = { runDir: run };
-  assert.equal(autoThreads(env, 16), 16);
+  assert.equal(autoThreads(env, 16), 8, 'at most 8');
+  assert.equal(autoThreads(env, 32), 8, 'at most 8');
+  assert.equal(autoThreads(env, 8), 8);
+  assert.equal(autoThreads(env, 4), 4);
+  assert.equal(autoThreads(env, 1), 2, 'never below 2');
+  assert.equal(transcriptionOptions({ threads: '16' }, env).threads, 16, '--threads is kept as given');
+  assert.ok(transcriptionOptions({}, env).threads <= 8, 'without --threads the limit applies');
   // two live recorders (this process stands in for both)
   for (const id of ['a', 'b']) fs.writeFileSync(path.join(run, `recording-${id}.json`), JSON.stringify({ pid: process.pid }));
   assert.equal(autoThreads(env, 16), 5);
+  assert.equal(autoThreads(env, 32), 8, 'at most 8');
   assert.equal(autoThreads(env, 4), 2, 'never below 2');
+  assert.equal(transcriptionOptions({ threads: '16' }, env).threads, 16, '--threads is not shared');
   fs.rmSync(data, { recursive: true, force: true });
 });
 
