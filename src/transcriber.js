@@ -25,12 +25,16 @@ const fs = require('node:fs');
 const { toAltEntries, render } = require('./format');
 
 const SAVE_EVERY_MS = 2000;
-/** Live: a chunk goes out at a pause once it holds this much speech... */
-const LIVE_PAUSE_FLUSH_S = 8;
+/**
+ * Live: a chunk goes out at a pause once it holds this much speech...
+ * A Whisper call costs about the same whatever the chunk length, so chunks that go out sooner cost
+ * more calls: on 112 s of a lecture, going out at 8 s took 57% more CPU time than at 16 s.
+ */
+const LIVE_PAUSE_FLUSH_S = 16;
 /** ...or when it holds this much... */
 const LIVE_FULL_S = 25;
 /** ...or when its oldest speech has waited this long. */
-const LIVE_MAX_WAIT_MS = 15000;
+const LIVE_MAX_WAIT_MS = 30000;
 /** File mode: chunks waiting in the recognizer before decoding pauses. */
 const MAX_IN_FLIGHT = 2;
 
