@@ -609,7 +609,7 @@ scriptorium.cmd ─ runtime\node.exe ─ app\src\cli.js
                                        │                 ├ Silero VAD: 말소리 구간 검출
                                        │                 └ pyannote segmentation + 3D-Speaker 임베딩: 화자 분리
                                        ├─ store.js ─── node:sqlite (노트 DB)
-                                       └─ mcp.js ───── MCP 서버 (stdio JSON-RPC, 도구마다 CLI를 실행)
+                                       └─ mcp.js ───── MCP 서버 (stdio JSON-RPC. 녹음 시작·파일 전사만 CLI를 따로 실행, 나머지는 서버 안에서 처리)
 ```
 
 1. 오디오를 16 kHz mono로 바꾼다 (파일은 Media Foundation, 녹음은 WASAPI. 마이크와 시스템 오디오는 더해서 [-1, 1]로 자른다)
